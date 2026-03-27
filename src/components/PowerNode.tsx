@@ -240,12 +240,10 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           {isEnabled && displayVoltage > 0 && (
             <div className="node-detail-sm">Vout: {displayVoltage.toFixed(2)}V</div>
           )}
-          {isEnabled && displayCurrent > 0 && analysis && (() => {
-            const scenarioSt = activeScenario ? analysis.scenarioStateResults?.[activeScenario] : undefined;
-            const sr = activeStateId ? (scenarioSt?.[activeStateId] ?? analysis.stateResults?.[activeStateId]) : undefined;
-            const loss = sr?.powerLoss ?? analysis.powerLossAvg;
-            const cur = sr?.currentOut ?? analysis.currentOut ?? 0;
-            const vdrop = cur > 0 ? loss / cur : 0;
+          {isEnabled && displayCurrent > 0 && (() => {
+            const vdrop = sd.seriesMode === 'diode'
+              ? (sd.forwardVoltage || 0)
+              : displayCurrent * (sd.resistance || 0);
             if (vdrop < 0.0001) return null;
             return <div className="node-detail-sm">Vdrop: {vdrop >= 0.1 ? `${vdrop.toFixed(2)}V` : `${(vdrop * 1000).toFixed(1)}mV`}</div>;
           })()}
