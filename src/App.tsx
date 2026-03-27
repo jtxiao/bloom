@@ -709,14 +709,27 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   const closeResults = useCallback(() => setShowResults(false), []);
 
   const wasPanningRef = useRef(false);
+  const moveStartViewport = useRef<{ x: number; y: number; zoom: number } | null>(null);
 
   const onMoveStart = useCallback((_: unknown, viewport: unknown) => {
-    void viewport;
-    wasPanningRef.current = true;
+    const vp = viewport as { x: number; y: number; zoom: number };
+    moveStartViewport.current = vp ? { x: vp.x, y: vp.y, zoom: vp.zoom } : null;
+    wasPanningRef.current = false;
   }, []);
 
-  const onMoveEnd = useCallback(() => {
-    setTimeout(() => { wasPanningRef.current = false; }, 50);
+  const onMoveEnd = useCallback((_: unknown, viewport: unknown) => {
+    const vp = viewport as { x: number; y: number; zoom: number };
+    const start = moveStartViewport.current;
+    if (start && vp) {
+      const dx = Math.abs(vp.x - start.x);
+      const dy = Math.abs(vp.y - start.y);
+      const dz = Math.abs(vp.zoom - start.zoom);
+      if (dx > 2 || dy > 2 || dz > 0.01) {
+        wasPanningRef.current = true;
+        setTimeout(() => { wasPanningRef.current = false; }, 80);
+      }
+    }
+    moveStartViewport.current = null;
   }, []);
 
   const onPaneClick = useCallback(() => {
