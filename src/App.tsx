@@ -708,32 +708,20 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   const closeResults = useCallback(() => setShowResults(false), []);
 
-  const wasPanningRef = useRef(false);
-  const moveStartViewport = useRef<{ x: number; y: number; zoom: number } | null>(null);
+  const mouseDownPos = useRef<{ x: number; y: number } | null>(null);
 
-  const onMoveStart = useCallback((_: unknown, viewport: unknown) => {
-    const vp = viewport as { x: number; y: number; zoom: number };
-    moveStartViewport.current = vp ? { x: vp.x, y: vp.y, zoom: vp.zoom } : null;
-    wasPanningRef.current = false;
+  const onFlowMouseDown = useCallback((e: React.MouseEvent) => {
+    mouseDownPos.current = { x: e.clientX, y: e.clientY };
   }, []);
 
-  const onMoveEnd = useCallback((_: unknown, viewport: unknown) => {
-    const vp = viewport as { x: number; y: number; zoom: number };
-    const start = moveStartViewport.current;
-    if (start && vp) {
-      const dx = Math.abs(vp.x - start.x);
-      const dy = Math.abs(vp.y - start.y);
-      const dz = Math.abs(vp.zoom - start.zoom);
-      if (dx > 2 || dy > 2 || dz > 0.01) {
-        wasPanningRef.current = true;
-        setTimeout(() => { wasPanningRef.current = false; }, 80);
-      }
+  const onPaneClick = useCallback((event: unknown) => {
+    const e = event as MouseEvent;
+    const start = mouseDownPos.current;
+    if (start) {
+      const dx = Math.abs(e.clientX - start.x);
+      const dy = Math.abs(e.clientY - start.y);
+      if (dx > 5 || dy > 5) return;
     }
-    moveStartViewport.current = null;
-  }, []);
-
-  const onPaneClick = useCallback(() => {
-    if (wasPanningRef.current) return;
     setSelectedNode(null);
     setShowResults(false);
     setContextMenu(null);
@@ -1687,7 +1675,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             )}
           </div>
         </div>
-        <div className="flow-container" ref={reactFlowWrapper}>
+        <div className="flow-container" ref={reactFlowWrapper} onMouseDown={onFlowMouseDown}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -1699,8 +1687,6 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             onNodeClick={onNodeClick}
             onNodeContextMenu={onNodeContextMenu}
             onPaneClick={onPaneClick}
-            onMoveStart={onMoveStart}
-            onMoveEnd={onMoveEnd}
             onNodesDelete={onNodesDelete}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
