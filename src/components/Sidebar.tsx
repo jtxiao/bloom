@@ -1,5 +1,6 @@
 import { DragEvent, useState } from 'react';
 import Tooltip from './Tooltip';
+import bloomLogo from '/bloom-logo.png?url';
 
 const componentTypes = [
   { type: 'source', label: 'Power Source', desc: 'Battery, USB, Wall adapter' },
@@ -28,7 +29,7 @@ export default function Sidebar({ theme, onToggleTheme, heatmap, onToggleHeatmap
   return (
     <aside className="sidebar">
       <div className="sidebar-logo">
-        <img className="logo-img" src="/bloom-logo.png" alt="bloom logo" />
+        <img className="logo-img" src={bloomLogo} alt="bloom logo" />
         <span className="logo-text">bloom</span>
       </div>
       <h2>Components</h2>
