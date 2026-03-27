@@ -110,9 +110,19 @@ function heatmapStyle(intensity: number): React.CSSProperties {
   };
 }
 
+function NoteIndicator({ notes }: { notes: string[] }) {
+  if (!notes || notes.length === 0) return null;
+  return (
+    <div className="node-note-indicator" title={notes.join('\n')}>
+      <span className="node-note-count">{notes.length}</span>
+    </div>
+  );
+}
+
 function PowerNode({ data }: { data: Record<string, unknown> }) {
-  const d = data as unknown as PowerNodeData & { _analysis?: AnalysisResult; _activeStateId?: string; _activeScenario?: VoltageScenario; _heatmap?: boolean; _maxLoss?: number };
+  const d = data as unknown as PowerNodeData & { _analysis?: AnalysisResult; _activeStateId?: string; _activeScenario?: VoltageScenario; _heatmap?: boolean; _maxLoss?: number; _notes?: string[] };
   const analysis = d._analysis;
+  const nodeNotes = d._notes;
   const activeStateId = d._activeStateId;
   const activeScenario = d._activeScenario;
   const showHeatmap = d._heatmap === true;
@@ -172,6 +182,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           })()}
         </div>
         {analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
         <Handle type="source" position={Position.Right} id="source" />
       </div>
     );
@@ -200,6 +211,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           </div>
         </div>
         {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
       </div>
@@ -238,6 +250,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           })()}
         </div>
         {isEnabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
       </div>
@@ -271,6 +284,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           <div className="node-detail-sm">{detail}</div>
         </div>
         {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
       </div>
     );
@@ -279,27 +293,32 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
   return null;
 }
 
+const META_KEYS = new Set(['_analysis', '_activeStateId', '_activeScenario', '_heatmap', '_maxLoss', '_notes']);
+
+function shallowEqualExceptMeta(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const keysA = Object.keys(a).filter(k => !META_KEYS.has(k));
+  const keysB = Object.keys(b).filter(k => !META_KEYS.has(k));
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
 function powerNodePropsEqual(
   prev: { data: Record<string, unknown> },
   next: { data: Record<string, unknown> },
 ): boolean {
   const pa = prev.data as Record<string, unknown>;
   const na = next.data as Record<string, unknown>;
-  // Quick reference check
   if (pa === na) return true;
-  // Compare analysis result by reference and key display fields
   if (pa._analysis !== na._analysis) return false;
   if (pa._activeStateId !== na._activeStateId) return false;
   if (pa._activeScenario !== na._activeScenario) return false;
   if (pa._heatmap !== na._heatmap) return false;
   if (pa._maxLoss !== na._maxLoss) return false;
-  // For the underlying node data, compare JSON (minus analysis props)
-  const stripMeta = (d: Record<string, unknown>) => {
-    const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = d;
-    void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
-    return rest;
-  };
-  return JSON.stringify(stripMeta(pa)) === JSON.stringify(stripMeta(na));
+  if (pa._notes !== na._notes) return false;
+  return shallowEqualExceptMeta(pa, na);
 }
 
 export default memo(PowerNode, powerNodePropsEqual);

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import type { Diagnostic } from '../types';
+import Tooltip from './Tooltip';
 
 interface DiagnosticsConsoleProps {
   diagnostics: Diagnostic[];
@@ -30,21 +31,23 @@ export default function DiagnosticsConsole({ diagnostics, onNodeClick }: Diagnos
 
   return (
     <div className={`diag-console ${expanded ? 'diag-expanded' : ''}`}>
-      <button className="diag-header" onClick={() => hasAny && setExpanded(!expanded)} style={{ cursor: hasAny ? 'pointer' : 'default' }}>
-        <span className="diag-title">Diagnostics</span>
-        <span className="diag-counts">
-          {hasAny ? (
-            <>
-              {errorCount > 0 && <span className="diag-count error">{SEVERITY_ICON.error} {errorCount}</span>}
-              {warnCount > 0 && <span className="diag-count warning">{SEVERITY_ICON.warning} {warnCount}</span>}
-              {infoCount > 0 && <span className="diag-count info">{SEVERITY_ICON.info} {infoCount}</span>}
-            </>
-          ) : (
-            <span className="diag-count clear">No issues</span>
-          )}
-        </span>
-        {hasAny && <span className="diag-chevron">{expanded ? '\u25BE' : '\u25B4'}</span>}
-      </button>
+      <Tooltip text="Warnings and errors about your power tree — click to expand">
+        <button className="diag-header" onClick={() => hasAny && setExpanded(!expanded)} style={{ cursor: hasAny ? 'pointer' : 'default' }}>
+          <span className="diag-title">Diagnostics</span>
+          <span className="diag-counts">
+            {hasAny ? (
+              <>
+                {errorCount > 0 && <span className="diag-count error">{SEVERITY_ICON.error} {errorCount}</span>}
+                {warnCount > 0 && <span className="diag-count warning">{SEVERITY_ICON.warning} {warnCount}</span>}
+                {infoCount > 0 && <span className="diag-count info">{SEVERITY_ICON.info} {infoCount}</span>}
+              </>
+            ) : (
+              <span className="diag-count clear">No issues</span>
+            )}
+          </span>
+          {hasAny && <span className="diag-chevron">{expanded ? '\u25BE' : '\u25B4'}</span>}
+        </button>
+      </Tooltip>
       {expanded && hasAny && (
         <div className="diag-list" ref={listRef}>
           {diagnostics.map((d, i) => (

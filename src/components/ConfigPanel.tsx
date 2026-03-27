@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, ChangeEvent } from 'react';
+import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react';
 import type { Node } from '@xyflow/react';
 import Papa from 'papaparse';
+import Tooltip from './Tooltip';
 import type {
   PowerNodeData,
   PowerSourceData,
@@ -209,32 +210,71 @@ function OptNumInput({ value, onChange, placeholder = '--' }: OptNumInputProps) 
 }
 
 export default function ConfigPanel({ node, onUpdate, onClose, onDelete, auxOverrides, onAuxOverrideToggle }: ConfigPanelProps) {
-  const data = node.data as unknown as PowerNodeData;
+  const incoming = node.data as unknown as PowerNodeData;
+  const [localData, setLocalData] = useState<PowerNodeData>(incoming);
+  const localRef = useRef(localData);
+  localRef.current = localData;
+
+  // Sync when the underlying node changes (e.g. switching selected node)
+  const nodeIdRef = useRef(node.id);
+  useEffect(() => {
+    if (node.id !== nodeIdRef.current) {
+      nodeIdRef.current = node.id;
+      setLocalData(incoming);
+      dirtyRef.current = false;
+    }
+  }, [node.id, incoming]);
+
+  // Track whether user made local edits
+  const dirtyRef = useRef(false);
+  const originalSetLocalData = setLocalData;
+  const setLocalDataTracked = useCallback((d: PowerNodeData | ((prev: PowerNodeData) => PowerNodeData)) => {
+    dirtyRef.current = true;
+    originalSetLocalData(d);
+  }, [originalSetLocalData]);
+
+  // Flush local edits to the real node data on unmount / close, but only if changed
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
+  useEffect(() => () => {
+    if (dirtyRef.current) {
+      onUpdateRef.current(nodeIdRef.current, localRef.current);
+    }
+  }, []);
+
+  const handleClose = () => {
+    if (dirtyRef.current) {
+      onUpdate(node.id, localData);
+    }
+    onClose();
+  };
+
+  const data = localData;
   const hasAux = data.type === 'source' || data.type === 'converter' || data.type === 'series';
 
   return (
     <div className="config-panel">
       <div className="config-header">
         <h3>Configure {data.type}</h3>
-        <button className="close-btn" onClick={onClose}>X</button>
+        <button className="close-btn" onClick={handleClose}>X</button>
       </div>
       <div className="config-body">
         {data.type === 'source' && (
-          <SourceConfig data={data} onChange={d => onUpdate(node.id, d)} />
+          <SourceConfig data={data} onChange={setLocalDataTracked} />
         )}
         {data.type === 'converter' && (
-          <ConverterConfig data={data as PowerConverterData} onChange={d => onUpdate(node.id, d)} />
+          <ConverterConfig data={data as PowerConverterData} onChange={setLocalDataTracked} />
         )}
         {data.type === 'series' && (
-          <SeriesConfig data={data as SeriesElementData} onChange={d => onUpdate(node.id, d)} />
+          <SeriesConfig data={data as SeriesElementData} onChange={setLocalDataTracked} />
         )}
         {data.type === 'load' && (
-          <LoadConfig data={data as LoadData} onChange={d => onUpdate(node.id, d)} />
+          <LoadConfig data={data as LoadData} onChange={setLocalDataTracked} />
         )}
         {hasAux && (
           <AuxLoadsSection
             auxLoads={(data as PowerSourceData | PowerConverterData | SeriesElementData).auxLoads || []}
-            onChange={auxLoads => onUpdate(node.id, { ...data, auxLoads } as PowerNodeData)}
+            onChange={auxLoads => { dirtyRef.current = true; setLocalData({ ...data, auxLoads } as PowerNodeData); }}
             overrides={auxOverrides}
             onToggle={onAuxOverrideToggle ? (auxId, enabled) => onAuxOverrideToggle(node.id, auxId, enabled) : undefined}
           />
@@ -1114,10 +1154,11 @@ function AuxLoadsSection({
                   <button
                     className={`aux-toggle ${enabled ? 'on' : 'off'}`}
                     onClick={() => onToggle(al.id, !enabled)}
-                    title={enabled ? 'Enabled (click to disable for this state)' : 'Disabled (click to enable for this state)'}
                   >{enabled ? 'ON' : 'OFF'}</button>
                 )}
-                <button className="aux-remove" onClick={() => removeAux(i)} title="Remove">X</button>
+                <Tooltip text="Remove this auxiliary load">
+                  <button className="aux-remove" onClick={() => removeAux(i)}>X</button>
+                </Tooltip>
               </div>
             );
           })}
