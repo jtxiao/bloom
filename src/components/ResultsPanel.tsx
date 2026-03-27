@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, memo } from 'react';
 import {
   LineChart,
   Line,
@@ -68,7 +68,7 @@ function formatTime(hours: number): string {
   return `${hours.toFixed(1)} hr`;
 }
 
-export default function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onClose, powerStates, activeStateId, theme = 'dark' }: ResultsPanelProps) {
+function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onClose, powerStates, activeStateId, theme = 'dark' }: ResultsPanelProps) {
   const tooltipStyle = theme === 'light'
     ? { background: '#FEFCF8', border: '1px solid #D5CEBC', borderRadius: 4 }
     : { background: '#1E222A', border: '1px solid #2A2E38', borderRadius: 4 };
@@ -195,9 +195,11 @@ export default function ResultsPanel({ results, scenarioTimeSeries, batteryDisch
     color: paletteColor(i),
   }));
 
-  const rawTimeSeries = scenarioTimeSeries.find(s => s.scenario === activeScenario)?.points
-    ?? scenarioTimeSeries.find(s => s.scenario === 'nom')?.points
-    ?? [];
+  const activeSts = scenarioTimeSeries.find(s => s.scenario === activeScenario)
+    ?? scenarioTimeSeries.find(s => s.scenario === 'nom');
+  const rawTimeSeries = (viewingState && activeSts?.statePoints?.[viewingState])
+    ? activeSts.statePoints[viewingState]
+    : activeSts?.points ?? [];
   const activeTimeSeries = (() => {
     if (rawTimeSeries.length <= 2) return rawTimeSeries;
     const period = rawTimeSeries[rawTimeSeries.length - 1].time - rawTimeSeries[0].time;
@@ -409,7 +411,7 @@ export default function ResultsPanel({ results, scenarioTimeSeries, batteryDisch
         </div>
       )}
 
-      {activeTimeSeries.length > 1 && (
+      {activeTimeSeries.length > 1 && (!hasMultiState || viewingState) && (
         <div className="chart-section">
           <div className="chart-header">
             <h4>Power Over Time</h4>
@@ -446,7 +448,7 @@ export default function ResultsPanel({ results, scenarioTimeSeries, batteryDisch
         </div>
       )}
 
-      {activeTimeSeries.length > 1 && (
+      {activeTimeSeries.length > 1 && (!hasMultiState || viewingState) && (
         <div className="chart-section">
           <div className="chart-header">
             <h4>Input Current Over Time</h4>
@@ -542,20 +544,27 @@ export default function ResultsPanel({ results, scenarioTimeSeries, batteryDisch
             </tr>
           </thead>
           <tbody>
-            {results.map((r, i) => (
-              <tr key={r.nodeId}>
-                <td>{r.label}</td>
-                <td className={`type-badge ${r.type}`}>{r.type}</td>
-                <td>{formatPowerSigFigs(getNodePower(r, i, 'inputPower'))}</td>
-                <td>{formatPowerSigFigs(getNodePower(r, i, 'outputPower'))}</td>
-                <td>{formatPowerSigFigs(getNodePower(r, i, 'auxPower'))}</td>
-                <td>{formatPowerSigFigs(getNodePower(r, i, 'powerLoss'))}</td>
-                <td>{(getNodePower(r, i, 'efficiency') * 100).toFixed(1)}%</td>
-              </tr>
-            ))}
+            {results.map((r, i) => {
+              const isLoad = r.type === 'load';
+              const inp = getNodePower(r, i, 'inputPower');
+              const auxVal = getNodePower(r, i, 'auxPower');
+              return (
+                <tr key={r.nodeId}>
+                  <td>{r.label}</td>
+                  <td className={`type-badge ${r.type}`}>{r.type}</td>
+                  <td>{formatPowerSigFigs(inp)}</td>
+                  <td>{isLoad ? '—' : formatPowerSigFigs(getNodePower(r, i, 'outputPower'))}</td>
+                  <td>{auxVal > 0 ? formatPowerSigFigs(auxVal) : '—'}</td>
+                  <td>{isLoad ? formatPowerSigFigs(inp) : formatPowerSigFigs(getNodePower(r, i, 'powerLoss'))}</td>
+                  <td>{isLoad ? '—' : `${(getNodePower(r, i, 'efficiency') * 100).toFixed(1)}%`}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
     </div>
   );
 }
+
+export default memo(ResultsPanel);

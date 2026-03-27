@@ -438,23 +438,41 @@ function findPseudoLcm(
   return null;
 }
 
-function buildUnifiedTimeline(nodes: Map<string, Node>): number[] {
+function buildUnifiedTimeline(
+  nodes: Map<string, Node>,
+  powerStates?: PowerState[]
+): number[] {
   const loadPeriods: { period: number; points: number[] }[] = [];
+  const seen = new Set<string>();
 
-  nodes.forEach(node => {
-    const data = node.data as unknown as PowerNodeData;
-    if (data.type === 'load') {
-      const ld = data as LoadData;
-      if (ld.loadMode === 'current_profile' && ld.loadProfile.length > 1) {
-        const sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
-        const period = sorted[sorted.length - 1].time;
-        const hasVariation = sorted.some(p => Math.abs(p.current - sorted[0].current) > 1e-12);
-        if (period > 0 && hasVariation) {
-          loadPeriods.push({ period, points: sorted.map(p => p.time) });
-        }
+  const addLoadProfile = (ld: LoadData, key: string) => {
+    if (seen.has(key)) return;
+    if (ld.loadMode === 'current_profile' && ld.loadProfile.length > 1) {
+      const sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
+      const period = sorted[sorted.length - 1].time;
+      const hasVariation = sorted.some(p => Math.abs(p.current - sorted[0].current) > 1e-12);
+      if (period > 0 && hasVariation) {
+        seen.add(key);
+        loadPeriods.push({ period, points: sorted.map(p => p.time) });
       }
     }
+  };
+
+  nodes.forEach((node, nid) => {
+    const data = node.data as unknown as PowerNodeData;
+    if (data.type === 'load') {
+      addLoadProfile(data as LoadData, `canvas:${nid}`);
+    }
   });
+
+  if (powerStates) {
+    for (const state of powerStates) {
+      if (!state.loadSnapshots) continue;
+      for (const [nid, snap] of Object.entries(state.loadSnapshots)) {
+        addLoadProfile(snap as LoadData, `${state.id}:${nid}`);
+      }
+    }
+  }
 
   if (loadPeriods.length === 0) return [0];
 
@@ -1217,12 +1235,13 @@ export function analyzeTree(
 
   const nodeMap = new Map<string, Node>();
   nodes.forEach(n => nodeMap.set(n.id, n));
-  const times = buildUnifiedTimeline(nodeMap);
   const sources = nodes.filter(n => (n.data as unknown as PowerNodeData).type === 'source');
 
   const states = powerStates && powerStates.length > 0
     ? powerStates
     : [{ id: 'default', name: 'Default', fractionOfTime: 1, loadSnapshots: {} as Record<string, LoadData> }];
+
+  const times = buildUnifiedTimeline(nodeMap, powerStates);
 
   const scenarios: VoltageScenario[] = ['nom'];
   let hasMin = false;
@@ -1327,6 +1346,45 @@ export function analyzeTree(
     }
   }
 
+  // Compute per-state time series for each scenario. Each state gets its own
+  // timeline built from that state's load profiles so the period is correct.
+  if (states.length > 1) {
+    for (const sts of scenarioTimeSeries) {
+      const statePoints: Record<string, TimeSeriesPoint[]> = {};
+      for (const state of states) {
+        const snm = stateNodeMaps.get(state.id)!;
+        const sv = scenarioStateSourceVoltages.get(`${sts.scenario}:${state.id}`)
+          ?? scenarioOCVMaps.get(sts.scenario)!;
+        const ocvMap = scenarioOCVMaps.get(sts.scenario)!;
+        const stateTimes = buildUnifiedTimeline(snm);
+        const pts: TimeSeriesPoint[] = [];
+        for (let ti = 0; ti < stateTimes.length; ti++) {
+          let inputPower = 0;
+          let inputCurrent = 0;
+          let totalLoad = 0;
+          for (const s of sources) {
+            const sd = s.data as unknown as PowerSourceData;
+            if (sd.type !== 'source') continue;
+            const ocv = ocvMap.get(s.id) ?? sd.nominalVoltage;
+            const cur = getNodeCurrentDraw(s.id, snm, edges, ti, stateTimes, sv, state.auxLoadOverrides);
+            inputPower += cur * ocv;
+            inputCurrent += cur;
+          }
+          snm.forEach((node, nid) => {
+            const d = node.data as unknown as PowerNodeData;
+            if (d.type === 'load') {
+              const loadV = resolveInputVoltage(nid, snm, edges, sv);
+              totalLoad += getLoadCurrent(d as LoadData, stateTimes[ti], loadV) * loadV;
+            }
+          });
+          pts.push({ time: roundTime(stateTimes[ti]), inputPower, inputCurrent, totalLoad });
+        }
+        statePoints[state.id] = pts;
+      }
+      sts.statePoints = statePoints;
+    }
+  }
+
   // Compute which nodes are disabled. A node is disabled if it's off in
   // ALL states with fractionOfTime > 0. We use enabledOverrides from
   // powerStates as the source of truth (not the canvas node's enabled field,
@@ -1410,11 +1468,6 @@ export function analyzeTree(
   const results: AnalysisResult[] = nodes.map(n => {
     const d = n.data as unknown as PowerNodeData;
     const nom = nomResults.get(n.id)!;
-    const allScenarios: Partial<Record<VoltageScenario, ScenarioResult>> = {};
-    for (const scenario of scenarios) {
-      allScenarios[scenario] = scenarioNodeResults.get(scenario)!.get(n.id)!;
-    }
-
     // Check if this node is downstream of a battery with dynamic simulation
     let dynamicAvg: DischargePowerAccum | undefined;
     let dynamicLifetime: number | undefined;
@@ -1428,23 +1481,36 @@ export function analyzeTree(
       }
     }
 
-    // Compute per-scenario, per-state results
+    // Compute per-scenario, per-state results and derive weighted-average
+    // ScenarioResults from them (instead of using runSingleScenario's
+    // canvas-only results).
     const scenarioStateResults: Partial<Record<VoltageScenario, Record<string, StateResult>>> = {};
+    const allScenarios: Partial<Record<VoltageScenario, ScenarioResult>> = {};
     for (const scenario of scenarios) {
       const scStateRes: Record<string, StateResult> = {};
+      let wIn = 0, wOut = 0;
       for (const state of states) {
         const snm = stateNodeMaps.get(state.id)!;
         const nodeData = snm.get(n.id)?.data as unknown as PowerNodeData ?? d;
         const sv = scenarioStateSourceVoltages.get(`${scenario}:${state.id}`) ?? scenarioOCVMaps.get(scenario)!;
-        scStateRes[state.id] = computeNodeStateResult(n.id, nodeData, snm, edges, times, sv, state.auxLoadOverrides);
+        const sr = computeNodeStateResult(n.id, nodeData, snm, edges, times, sv, state.auxLoadOverrides);
+        scStateRes[state.id] = sr;
+        wIn += sr.inputPower * state.fractionOfTime;
+        wOut += sr.outputPower * state.fractionOfTime;
       }
       scenarioStateResults[scenario] = scStateRes;
+      allScenarios[scenario] = {
+        inputPowerAvg: wIn,
+        outputPowerAvg: wOut,
+        powerLossAvg: Math.max(0, wIn - wOut),
+        efficiencyAvg: wIn > 0 ? wOut / wIn : 1,
+      };
     }
 
     // Use nominal scenario for the default stateResults
     const stateResults = scenarioStateResults['nom'] ?? {};
-    let weightedInputPower = 0;
-    let weightedOutputPower = 0;
+    let weightedInputPower = allScenarios['nom']?.inputPowerAvg ?? 0;
+    let weightedOutputPower = allScenarios['nom']?.outputPowerAvg ?? 0;
     let weightedAuxPower = 0;
     let weightedCurrentOut = 0;
     let voltageOut = 0;
@@ -1452,8 +1518,6 @@ export function analyzeTree(
     for (const state of states) {
       const sr = stateResults[state.id];
       if (!sr) continue;
-      weightedInputPower += sr.inputPower * state.fractionOfTime;
-      weightedOutputPower += sr.outputPower * state.fractionOfTime;
       weightedAuxPower += sr.auxPower * state.fractionOfTime;
       weightedCurrentOut += sr.currentOut * state.fractionOfTime;
       voltageOut += sr.voltageOut * state.fractionOfTime;
@@ -1563,10 +1627,26 @@ export function analyzeTree(
 
     const resultMap = new Map(results.map(res => [res.nodeId, res]));
 
+    const parentMap = new Map<string, string>();
+    for (const e of edges) parentMap.set(e.target, e.source);
+
+    const isNodeOffInState = (nodeId: string, snm: Map<string, Node>): boolean => {
+      const nd = snm.get(nodeId);
+      if (!nd) return false;
+      const dd = nd.data as unknown as PowerNodeData;
+      if (dd.type === 'series' || dd.type === 'converter' || dd.type === 'load') {
+        if ((dd as { enabled?: boolean }).enabled === false) return true;
+      }
+      const pid = parentMap.get(nodeId);
+      if (pid) return isNodeOffInState(pid, snm);
+      return false;
+    };
+
     for (const scenario of scenarios) {
       const scenarioLabel = scenarios.length > 1 ? ` (${scenario.toUpperCase()} Vin)` : '';
       for (const state of states) {
         const stateLabel = states.length > 1 ? ` in "${state.name}"` : '';
+        const snm = stateNodeMaps.get(state.id)!;
 
         for (const n of nodes) {
           const d = n.data as unknown as PowerNodeData;
@@ -1575,8 +1655,9 @@ export function analyzeTree(
           const sr = r.scenarioStateResults?.[scenario]?.[state.id];
           if (!sr) continue;
 
-          // Get input voltage from parent's output voltage in the same scenario/state
-          const parentId = getParent(n.id, edges);
+          if (isNodeOffInState(n.id, snm)) continue;
+
+          const parentId = parentMap.get(n.id);
           const parentSr = parentId ? resultMap.get(parentId)?.scenarioStateResults?.[scenario]?.[state.id] : undefined;
           const inputV = parentSr?.voltageOut ?? 0;
 
@@ -1624,18 +1705,15 @@ export function analyzeTree(
             }
           }
 
-          if ((d.type === 'load' || d.type === 'converter') && sr.voltageOut === 0 && !r.disabled) {
-            const enabled = d.type === 'load' ? (d as LoadData).enabled !== false : (d as PowerConverterData).enabled !== false;
-            if (enabled) {
-              diagnostics.push({
-                severity: 'error',
-                nodeId: n.id,
-                nodeLabel: d.label,
-                scenario: scenarios.length > 1 ? scenario : undefined,
-                stateId: states.length > 1 ? state.id : undefined,
-                message: `"${d.label}" is enabled but receiving 0V${scenarioLabel}${stateLabel}`,
-              });
-            }
+          if ((d.type === 'load' || d.type === 'converter') && sr.voltageOut === 0) {
+            diagnostics.push({
+              severity: 'error',
+              nodeId: n.id,
+              nodeLabel: d.label,
+              scenario: scenarios.length > 1 ? scenario : undefined,
+              stateId: states.length > 1 ? state.id : undefined,
+              message: `"${d.label}" is enabled but receiving 0V${scenarioLabel}${stateLabel}`,
+            });
           }
         }
       }
