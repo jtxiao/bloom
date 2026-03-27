@@ -31,7 +31,9 @@ function interpolateEfficiency(curve: EfficiencyPoint[], loadCurrent: number): n
   if (loadCurrent >= sorted[sorted.length - 1].loadCurrent) return sorted[sorted.length - 1].efficiency;
   for (let i = 0; i < sorted.length - 1; i++) {
     if (loadCurrent >= sorted[i].loadCurrent && loadCurrent <= sorted[i + 1].loadCurrent) {
-      const t = (loadCurrent - sorted[i].loadCurrent) / (sorted[i + 1].loadCurrent - sorted[i].loadCurrent);
+      const denom = sorted[i + 1].loadCurrent - sorted[i].loadCurrent;
+      if (denom === 0) return sorted[i].efficiency;
+      const t = (loadCurrent - sorted[i].loadCurrent) / denom;
       return sorted[i].efficiency + t * (sorted[i + 1].efficiency - sorted[i].efficiency);
     }
   }
@@ -48,7 +50,9 @@ function getEfficiencyForVin(curves: EfficiencyCurveSet[], inputVoltage: number,
     if (inputVoltage >= sorted[i].inputVoltage && inputVoltage <= sorted[i + 1].inputVoltage) {
       const effLow = interpolateEfficiency(sorted[i].points, loadCurrent);
       const effHigh = interpolateEfficiency(sorted[i + 1].points, loadCurrent);
-      const t = (inputVoltage - sorted[i].inputVoltage) / (sorted[i + 1].inputVoltage - sorted[i].inputVoltage);
+      const denom = sorted[i + 1].inputVoltage - sorted[i].inputVoltage;
+      if (denom === 0) return effLow;
+      const t = (inputVoltage - sorted[i].inputVoltage) / denom;
       return effLow + t * (effHigh - effLow);
     }
   }
@@ -555,7 +559,9 @@ function interpolateDischargeVoltage(curve: DischargeCurvePoint[], capacityUsedM
   if (capacityUsedMah >= sorted[sorted.length - 1].capacityMah) return sorted[sorted.length - 1].voltage;
   for (let i = 0; i < sorted.length - 1; i++) {
     if (capacityUsedMah >= sorted[i].capacityMah && capacityUsedMah <= sorted[i + 1].capacityMah) {
-      const t = (capacityUsedMah - sorted[i].capacityMah) / (sorted[i + 1].capacityMah - sorted[i].capacityMah);
+      const denom = sorted[i + 1].capacityMah - sorted[i].capacityMah;
+      if (denom === 0) return sorted[i].voltage;
+      const t = (capacityUsedMah - sorted[i].capacityMah) / denom;
       return sorted[i].voltage + t * (sorted[i + 1].voltage - sorted[i].voltage);
     }
   }
@@ -601,10 +607,13 @@ function interpolateDischargeVoltageForTemp(
       for (let i = 0; i < sorted.length - 1; i++) {
         if (tempC >= sorted[i].tempC && tempC <= sorted[i + 1].tempC) { lo = i; break; }
       }
-      const t = (tempC - sorted[lo].tempC) / (sorted[lo + 1].tempC - sorted[lo].tempC);
       const vLo = interpolateDischargeVoltage(sorted[lo].points, capacityUsedMah);
       const vHi = interpolateDischargeVoltage(sorted[lo + 1].points, capacityUsedMah);
-      v = vLo + t * (vHi - vLo);
+      const denom = sorted[lo + 1].tempC - sorted[lo].tempC;
+      if (denom === 0) { v = vLo; } else {
+        const t = (tempC - sorted[lo].tempC) / denom;
+        v = vLo + t * (vHi - vLo);
+      }
     }
 
     totalV += v * weight;

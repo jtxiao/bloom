@@ -110,11 +110,11 @@ function heatmapStyle(intensity: number): React.CSSProperties {
   };
 }
 
-function NoteIndicator({ notes }: { notes: string[] }) {
+function NoteTooltip({ notes }: { notes: string[] }) {
   if (!notes || notes.length === 0) return null;
   return (
-    <div className="node-note-indicator" title={notes.join('\n')}>
-      <span className="node-note-count">{notes.length}</span>
+    <div className="node-note-hover">
+      <div className="node-note-tooltip">{notes.join('\n')}</div>
     </div>
   );
 }
@@ -182,7 +182,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           })()}
         </div>
         {analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
-        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
+        {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="source" position={Position.Right} id="source" />
       </div>
     );
@@ -211,7 +211,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           </div>
         </div>
         {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
-        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
+        {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
       </div>
@@ -241,7 +241,8 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
             <div className="node-detail-sm">Vout: {displayVoltage.toFixed(2)}V</div>
           )}
           {isEnabled && displayCurrent > 0 && analysis && (() => {
-            const sr = activeStateId ? analysis.stateResults?.[activeStateId] : undefined;
+            const scenarioSt = activeScenario ? analysis.scenarioStateResults?.[activeScenario] : undefined;
+            const sr = activeStateId ? (scenarioSt?.[activeStateId] ?? analysis.stateResults?.[activeStateId]) : undefined;
             const loss = sr?.powerLoss ?? analysis.powerLossAvg;
             const cur = sr?.currentOut ?? analysis.currentOut ?? 0;
             const vdrop = cur > 0 ? loss / cur : 0;
@@ -250,7 +251,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           })()}
         </div>
         {isEnabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
-        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
+        {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
       </div>
@@ -284,7 +285,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           <div className="node-detail-sm">{detail}</div>
         </div>
         {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
-        {nodeNotes && <NoteIndicator notes={nodeNotes} />}
+        {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
       </div>
     );

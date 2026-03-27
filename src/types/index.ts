@@ -4,6 +4,7 @@ export interface NoteBullet {
   id: string;
   text: string;
   nodeId?: string;
+  nodeIds?: string[];
 }
 export type ConverterType = 'switching' | 'ldo';
 export type LoadMode = 'current_profile' | 'resistor' | 'fixed_current';

@@ -22,6 +22,7 @@ import ConfigPanel from './components/ConfigPanel';
 import ResultsPanel from './components/ResultsPanel';
 import SmartBezierEdge from './components/SmartBezierEdge';
 import DiagnosticsConsole from './components/DiagnosticsConsole';
+import NotesDrawer from './components/NotesDrawer';
 import NodeSearch from './components/NodeSearch';
 import Tooltip from './components/Tooltip';
 import { analyzeTree } from './engine/calculate';
@@ -197,7 +198,7 @@ let _nodeFpCache = new WeakMap<Record<string, unknown>, string>();
 let _edgesFpCache: { ref: unknown; fp: string } = { ref: null, fp: '' };
 let _statesFpCache: { ref: unknown; fp: string } = { ref: null, fp: '' };
 
-function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNotes, notesOpen, onSetNotesOpen, nodeListRef, navigateToNodeRef }: { theme: 'dark' | 'light'; onSetTheme: (t: 'dark' | 'light') => void; heatmap: boolean; projectNotes: NoteBullet[]; onSetProjectNotes: (n: NoteBullet[]) => void; notesOpen: boolean; onSetNotesOpen: (v: boolean) => void; nodeListRef: React.MutableRefObject<{ id: string; label: string }[]>; navigateToNodeRef: React.MutableRefObject<(nodeId: string) => void> }) {
+function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNotes, onSetNotesOpen, nodeListRef, navigateToNodeRef }: { theme: 'dark' | 'light'; onSetTheme: (t: 'dark' | 'light') => void; heatmap: boolean; projectNotes: NoteBullet[]; onSetProjectNotes: (n: NoteBullet[]) => void; onSetNotesOpen: (v: boolean) => void; nodeListRef: React.MutableRefObject<{ id: string; label: string }[]>; navigateToNodeRef: React.MutableRefObject<(nodeId: string) => void> }) {
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const { screenToFlowPosition, setCenter, getZoom, fitView } = useReactFlow();
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
@@ -673,11 +674,13 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   }, []);
 
   const addNoteForNode = useCallback((nId: string) => {
-    const bullet: NoteBullet = { id: crypto.randomUUID(), text: '', nodeId: nId };
+    const node = (nodes as Node[]).find(n => n.id === nId);
+    const label = node ? ((node.data as Record<string, unknown>).label as string) || nId : nId;
+    const bullet: NoteBullet = { id: crypto.randomUUID(), text: '\u2022 @' + label + ' ', nodeIds: [nId] };
     onSetProjectNotes([...projectNotes, bullet]);
     onSetNotesOpen(true);
     setContextMenu(null);
-  }, [projectNotes, onSetProjectNotes, onSetNotesOpen]);
+  }, [projectNotes, onSetProjectNotes, onSetNotesOpen, nodes]);
 
   const onTextNodeChange = useCallback((nodeId: string, updates: Record<string, unknown>) => {
     setNodes(nds => nds.map(n => {
@@ -705,7 +708,19 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   const closeResults = useCallback(() => setShowResults(false), []);
 
+  const wasPanningRef = useRef(false);
+
+  const onMoveStart = useCallback((_: unknown, viewport: unknown) => {
+    void viewport;
+    wasPanningRef.current = true;
+  }, []);
+
+  const onMoveEnd = useCallback(() => {
+    setTimeout(() => { wasPanningRef.current = false; }, 50);
+  }, []);
+
   const onPaneClick = useCallback(() => {
+    if (wasPanningRef.current) return;
     setSelectedNode(null);
     setShowResults(false);
     setContextMenu(null);
@@ -958,10 +973,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     });
   }, []);
 
-  useEffect(() => {
-    const skip = skipAnalysisRef.current;
-    if (skip) skipAnalysisRef.current = false;
-
+  const analysisFp = (() => {
     const cache = _nodeFpCache;
     const nodeParts: string[] = [];
     for (const n of nodes) {
@@ -982,11 +994,16 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     if (_statesFpCache.ref !== powerStates) {
       _statesFpCache = { ref: powerStates, fp: JSON.stringify(powerStates) };
     }
-    const fp = nodeParts.join('|') + '||' + _edgesFpCache.fp
+    return nodeParts.join('|') + '||' + _edgesFpCache.fp
       + '||' + _statesFpCache.fp + '||v' + ANALYSIS_VERSION;
+  })();
 
-    if (fp === _analysisFingerprint) return;
-    _analysisFingerprint = fp;
+  useEffect(() => {
+    const skip = skipAnalysisRef.current;
+    if (skip) skipAnalysisRef.current = false;
+
+    if (analysisFp === _analysisFingerprint) return;
+    _analysisFingerprint = analysisFp;
     if (skip) return;
 
     if (nodes.length === 0) {
@@ -1013,7 +1030,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       });
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, edges, powerStates]);
+  }, [analysisFp]);
 
   // Re-inject display props when activeScenario or activeStateId changes (no re-analysis needed)
   useEffect(() => {
@@ -1101,14 +1118,43 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeScenario, activeStateId, theme, heatmap]);
 
-  // Inject _notes into node data for PowerNode rendering
+  const nodeLabelFp = (() => {
+    const parts: string[] = [];
+    for (const n of nodes as Node[]) {
+      if (n.type === 'groupNode' || n.type === 'textNode') continue;
+      parts.push(n.id + ':' + (((n.data as Record<string, unknown>).label as string) || n.id));
+    }
+    return parts.join('|');
+  })();
+
   useEffect(() => {
+    const nodesByLabel = new Map<string, string>();
+    for (const part of nodeLabelFp.split('|')) {
+      if (!part) continue;
+      const sep = part.indexOf(':');
+      const id = part.slice(0, sep);
+      const label = part.slice(sep + 1);
+      nodesByLabel.set(label, id);
+    }
+    const labelsSorted = [...nodesByLabel.keys()].sort((a, b) => b.length - a.length);
     const notesByNode = new Map<string, string[]>();
     for (const b of projectNotes) {
-      if (b.nodeId && b.text.trim()) {
-        const arr = notesByNode.get(b.nodeId);
-        if (arr) arr.push(b.text);
-        else notesByNode.set(b.nodeId, [b.text]);
+      if (!b.text.trim()) continue;
+      let searchPos = 0;
+      while (searchPos < b.text.length) {
+        const atIdx = b.text.indexOf('@', searchPos);
+        if (atIdx < 0) break;
+        const after = b.text.slice(atIdx + 1);
+        const matchedLabel = labelsSorted.find(l => after.startsWith(l));
+        if (matchedLabel) {
+          const nId = nodesByLabel.get(matchedLabel)!;
+          const arr = notesByNode.get(nId);
+          if (arr) { if (!arr.includes(b.text)) arr.push(b.text); }
+          else notesByNode.set(nId, [b.text]);
+          searchPos = atIdx + 1 + matchedLabel.length;
+        } else {
+          searchPos = atIdx + 1;
+        }
       }
     }
     setNodes(nds => {
@@ -1124,7 +1170,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       return changed ? updated : nds;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectNotes]);
+  }, [projectNotes, nodeLabelFp]);
 
   const resetProject = useCallback(() => {
     _analysisFingerprint = '';
@@ -1249,6 +1295,18 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     }, null, 2);
   }, [nodes, edges, powerStates, projectName, projectNotes, theme, activeScenario, snapshotCurrentLoads]);
 
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+    autoSaveTimer.current = setTimeout(() => {
+      try {
+        localStorage.setItem('power-tree-autosave', buildProjectJson());
+      } catch { /* storage full or unavailable */ }
+    }, 1000);
+    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current); };
+  }, [nodes, edges, powerStates, projectName, projectNotes, theme, activeScenario, buildProjectJson]);
+
   const [saveToast, setSaveToast] = useState(false);
   const showSaveToast = useCallback(() => {
     setSaveToast(true);
@@ -1265,33 +1323,13 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         showSaveToast();
         return;
       } catch {
-        // Permission revoked or handle stale — fall through to Save As
+        // Permission revoked or handle stale — fall through
       }
     }
-    // No existing handle — behave like Save As
-    if ('showSaveFilePicker' in window) {
-      try {
-        const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
-          suggestedName: `${projectName.replace(/[^a-zA-Z0-9_-]/g, '_') || 'power-tree'}.json`,
-          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
-        });
-        fileHandleRef.current = handle;
-        const writable = await handle.createWritable();
-        await writable.write(json);
-        await writable.close();
-        showSaveToast();
-      } catch { /* user cancelled */ }
-    } else {
-      const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${projectName.replace(/[^a-zA-Z0-9_-]/g, '_') || 'power-tree'}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      showSaveToast();
-    }
-  }, [buildProjectJson, projectName, showSaveToast]);
+    // No file handle — save to localStorage and show toast
+    try { localStorage.setItem('power-tree-autosave', json); } catch { /* */ }
+    showSaveToast();
+  }, [buildProjectJson, showSaveToast]);
 
   saveProjectRef.current = saveProject;
 
@@ -1382,7 +1420,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
       if (project.projectName) setProjectName(project.projectName);
       if (Array.isArray(project.notes)) {
-        onSetProjectNotes(project.notes);
+        onSetProjectNotes(project.notes.map((b: NoteBullet) => {
+          if (b.nodeId && !b.nodeIds) return { ...b, nodeIds: [b.nodeId] };
+          return b;
+        }));
       } else if (typeof project.notes === 'string' && project.notes.trim()) {
         onSetProjectNotes(project.notes.split('\n').filter((l: string) => l.trim()).map((l: string) => ({ id: crypto.randomUUID(), text: l.trim() })));
       } else {
@@ -1409,6 +1450,17 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       alert('Invalid project file.');
     }
   }, [setNodes, setEdges, theme, onSetTheme, setPowerStates]);
+
+  const didAutoLoad = useRef(false);
+  useEffect(() => {
+    if (didAutoLoad.current) return;
+    didAutoLoad.current = true;
+    try {
+      const saved = localStorage.getItem('power-tree-autosave');
+      if (saved) loadProjectFromJson(saved);
+    } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const doLoadProject = useCallback(async () => {
     if ('showOpenFilePicker' in window) {
@@ -1493,15 +1545,31 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     setPowerStates(prev => {
       const next = prev.filter(s => s.id !== stateId);
       if (next.length === 0) return prev;
-      // If we're removing the active state, switch to the first remaining state
       if (activeStateIdRef.current === stateId) {
-        const newActiveId = next[0].id;
+        const targetState = next[0];
+        const newActiveId = targetState.id;
         activeStateIdRef.current = newActiveId;
         setActiveStateId(newActiveId);
+        setNodes(nds => nds.map(n => {
+          const d = n.data as Record<string, unknown>;
+          const nodeType = (d as unknown as PowerNodeData).type;
+          let newData = { ...d };
+          if (targetState.enabledOverrides && n.id in targetState.enabledOverrides &&
+              (nodeType === 'converter' || nodeType === 'series' || nodeType === 'load')) {
+            newData = { ...newData, enabled: targetState.enabledOverrides[n.id] };
+          }
+          if (nodeType !== 'load') return { ...n, data: newData };
+          const snap = targetState.loadSnapshots[n.id];
+          if (snap) {
+            const enabled = targetState.enabledOverrides?.[n.id] ?? (snap.enabled !== false);
+            return { ...n, data: { ...snap, label: d.label, enabled, _analysis: d._analysis, _activeStateId: newActiveId } };
+          }
+          return { ...n, data: newData };
+        }));
       }
       return next;
     });
-  }, []);
+  }, [setNodes]);
 
   const updateStateFraction = useCallback((stateId: string, fraction: number) => {
     const clamped = Math.max(0, Math.min(1, fraction));
@@ -1618,6 +1686,8 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             onNodeClick={onNodeClick}
             onNodeContextMenu={onNodeContextMenu}
             onPaneClick={onPaneClick}
+            onMoveStart={onMoveStart}
+            onMoveEnd={onMoveEnd}
             onNodesDelete={onNodesDelete}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
@@ -1625,7 +1695,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             defaultViewport={{ x: 100, y: 100, zoom: 1 }}
             minZoom={0.05}
             maxZoom={4}
-            deleteKeyCode="Backspace"
+            deleteKeyCode={['Backspace', 'Delete']}
             connectionRadius={30}
             connectOnClick={false}
             panOnDrag
@@ -1767,7 +1837,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         <div className="panel-overlay" onClick={() => handleSaveConfirm('cancel')}>
           <div className="state-manager-panel" style={{ maxWidth: 380, padding: 24 }} onClick={e => e.stopPropagation()}>
             <h2 style={{ margin: '0 0 16px', fontSize: 18 }}>{showSaveConfirm === 'new' ? 'New Project' : 'Load Project'}</h2>
-            <p style={{ margin: '0 0 24px', color: 'var(--text-secondary)', fontSize: 14, lineHeight: 1.5 }}>
+            <p style={{ margin: '0 0 24px', color: 'var(--text-dim)', fontSize: 14, lineHeight: 1.5 }}>
               Do you want to save the current project first?
             </p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
@@ -1839,8 +1909,19 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   );
 }
 
+function getInitialTheme(): 'dark' | 'light' {
+  try {
+    const saved = localStorage.getItem('power-tree-autosave');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed.theme === 'dark' || parsed.theme === 'light') return parsed.theme;
+    }
+  } catch { /* */ }
+  return 'light';
+}
+
 export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>('light');
+  const [theme, setTheme] = useState<'dark' | 'light'>(getInitialTheme);
   const [heatmap, setHeatmap] = useState(false);
   const [projectNotes, setProjectNotes] = useState<NoteBullet[]>([]);
   const [notesOpen, setNotesOpen] = useState(false);
@@ -1858,15 +1939,17 @@ export default function App() {
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         heatmap={heatmap}
         onToggleHeatmap={() => setHeatmap(h => !h)}
+      />
+      <NotesDrawer
+        open={notesOpen}
+        onToggle={() => setNotesOpen(o => !o)}
         notes={projectNotes}
         onNotesChange={setProjectNotes}
-        notesOpen={notesOpen}
-        onNotesOpenChange={setNotesOpen}
         nodeList={nodeListRef}
         onNodeNavigate={navigateToNodeRef}
       />
       <ReactFlowProvider>
-        <FlowCanvas theme={theme} onSetTheme={setTheme} heatmap={heatmap} projectNotes={projectNotes} onSetProjectNotes={setProjectNotes} notesOpen={notesOpen} onSetNotesOpen={setNotesOpen} nodeListRef={nodeListRef} navigateToNodeRef={navigateToNodeRef} />
+        <FlowCanvas theme={theme} onSetTheme={setTheme} heatmap={heatmap} projectNotes={projectNotes} onSetProjectNotes={setProjectNotes} onSetNotesOpen={setNotesOpen} nodeListRef={nodeListRef} navigateToNodeRef={navigateToNodeRef} />
       </ReactFlowProvider>
     </div>
   );

@@ -72,6 +72,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
   const tooltipStyle = theme === 'light'
     ? { background: '#FEFCF8', border: '1px solid #D5CEBC', borderRadius: 4 }
     : { background: '#1E222A', border: '1px solid #2A2E38', borderRadius: 4 };
+  const tooltipLabelColor = theme === 'light' ? '#2C2A26' : '#D8DAE0';
   const gridColor = theme === 'light' ? '#D5CEBC' : '#2A2E38';
   const axisColor = theme === 'light' ? '#7A7568' : '#8B8F9A';
   const scenarios = scenarioTimeSeries.map(s => s.scenario);
@@ -434,7 +435,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
               <YAxis tick={{ fill: axisColor, fontSize: 11 }} label={{ value: 'mW', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} />
               <Tooltip
                 contentStyle={tooltipStyle}
-                labelStyle={{ color: '#ddd' }}
+                labelStyle={{ color: tooltipLabelColor }}
                 labelFormatter={(v: number) => `${v} ${timeUnit}`}
               />
               <Legend verticalAlign="top" wrapperStyle={{ fontSize: 11, paddingBottom: 4 }} />
@@ -470,7 +471,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
               <YAxis tick={{ fill: axisColor, fontSize: 11 }} label={{ value: 'mA', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} />
               <Tooltip
                 contentStyle={tooltipStyle}
-                labelStyle={{ color: '#ddd' }}
+                labelStyle={{ color: tooltipLabelColor }}
                 labelFormatter={(v: number) => `${v} ${timeUnit}`}
               />
               <Line type="stepAfter" dataKey="inputCurrent" name="Input Current (mA)" stroke="#D4A24E" strokeWidth={2} dot={false} isAnimationActive={false} />
@@ -502,7 +503,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
                     label={{ value: 'V', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} domain={['auto', 'auto']} />
                   <Tooltip
                     contentStyle={tooltipStyle}
-                    labelStyle={{ color: '#ddd' }}
+                    labelStyle={{ color: tooltipLabelColor }}
                     labelFormatter={(v: number) => `${v} hr`} />
                   <Line type="monotone" dataKey="voltage" name="Voltage (V)" stroke="#D4A24E" strokeWidth={2} dot={false} />
                 </LineChart>
@@ -519,7 +520,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
                     label={{ value: 'mA', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} domain={['auto', 'auto']} />
                   <Tooltip
                     contentStyle={tooltipStyle}
-                    labelStyle={{ color: '#ddd' }}
+                    labelStyle={{ color: tooltipLabelColor }}
                     labelFormatter={(v: number) => `${v} hr`} />
                   <Line type="monotone" dataKey="currentMa" name="Current (mA)" stroke="#5C7B8A" strokeWidth={2} dot={false} />
                 </LineChart>
@@ -551,7 +552,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
               return (
                 <tr key={r.nodeId}>
                   <td>{r.label}</td>
-                  <td className={`type-badge ${r.type}`}>{r.type}</td>
+                  <td><span className={`type-badge ${r.type}`}>{r.type}</span></td>
                   <td>{formatPowerSigFigs(inp)}</td>
                   <td>{isLoad ? '—' : formatPowerSigFigs(getNodePower(r, i, 'outputPower'))}</td>
                   <td>{auxVal > 0 ? formatPowerSigFigs(auxVal) : '—'}</td>

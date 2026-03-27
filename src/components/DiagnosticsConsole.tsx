@@ -30,7 +30,7 @@ export default function DiagnosticsConsole({ diagnostics, onNodeClick }: Diagnos
   const hasAny = diagnostics.length > 0;
 
   return (
-    <div className={`diag-console ${expanded ? 'diag-expanded' : ''}`}>
+    <div className="diag-console">
       <Tooltip text="Warnings and errors about your power tree — click to expand">
         <button className="diag-header" onClick={() => hasAny && setExpanded(!expanded)} style={{ cursor: hasAny ? 'pointer' : 'default' }}>
           <span className="diag-title">Diagnostics</span>
