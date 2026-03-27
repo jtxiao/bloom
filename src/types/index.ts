@@ -1,4 +1,10 @@
 export type NodeType = 'source' | 'converter' | 'load' | 'series';
+
+export interface NoteBullet {
+  id: string;
+  text: string;
+  nodeId?: string;
+}
 export type ConverterType = 'switching' | 'ldo';
 export type LoadMode = 'current_profile' | 'resistor' | 'fixed_current';
 export type SeriesMode = 'resistor' | 'diode';
@@ -170,6 +176,7 @@ export interface BatteryTimeSeriesPoint {
 export interface ScenarioTimeSeries {
   scenario: VoltageScenario;
   points: TimeSeriesPoint[];
+  statePoints?: Record<string, TimeSeriesPoint[]>;
 }
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info';
