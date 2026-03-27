@@ -1168,7 +1168,7 @@ function computeNodeStateResult(
     } else if (d.type === 'source') {
       stepOutputPower = stepCurrent * stepVoltageOut;
     } else if (d.type === 'series') {
-      stepOutputPower = stepInputPower - getSeriesLoss(d as SeriesElementData, stepCurrent);
+      stepOutputPower = stepCurrent * stepVoltageOut;
     } else if (stepCurrent > 0) {
       const children = getChildren(nodeId, edges);
       let childPower = 0;
