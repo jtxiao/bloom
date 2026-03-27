@@ -23,6 +23,7 @@ import ResultsPanel from './components/ResultsPanel';
 import SmartBezierEdge from './components/SmartBezierEdge';
 import DiagnosticsConsole from './components/DiagnosticsConsole';
 import NodeSearch from './components/NodeSearch';
+import Tooltip from './components/Tooltip';
 import { analyzeTree } from './engine/calculate';
 import type {
   PowerNodeData,
@@ -36,6 +37,7 @@ import type {
   SeriesElementData,
   PowerState,
   VoltageScenario,
+  NoteBullet,
 } from './types';
 
 const nodeTypes = { powerNode: PowerNode, groupNode: GroupNode, textNode: TextNode };
@@ -156,19 +158,61 @@ function HeatmapScale({ maxLoss }: { maxLoss: number }) {
   );
 }
 
-function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; onSetTheme: (t: 'dark' | 'light') => void; heatmap: boolean }) {
+function FractionInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const [local, setLocal] = useState((value * 100).toFixed(0));
+  const committed = useRef(value);
+  useEffect(() => {
+    if (value !== committed.current) {
+      setLocal((value * 100).toFixed(0));
+      committed.current = value;
+    }
+  }, [value]);
+  const commit = () => {
+    const v = parseFloat(local);
+    const clamped = isNaN(v) ? 0 : Math.max(0, Math.min(100, v));
+    setLocal(clamped.toFixed(0));
+    const fraction = clamped / 100;
+    if (fraction !== committed.current) {
+      committed.current = fraction;
+      onChange(fraction);
+    }
+  };
+  return (
+    <label className="state-fraction-label">
+      <input
+        type="text"
+        inputMode="decimal"
+        value={local}
+        onChange={e => setLocal(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => { if (e.key === 'Enter') commit(); }}
+      />
+      %
+    </label>
+  );
+}
+
+let _analysisFingerprint = '';
+let _nodeFpCache = new WeakMap<Record<string, unknown>, string>();
+let _edgesFpCache: { ref: unknown; fp: string } = { ref: null, fp: '' };
+let _statesFpCache: { ref: unknown; fp: string } = { ref: null, fp: '' };
+
+function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNotes, notesOpen, onSetNotesOpen, nodeListRef, navigateToNodeRef }: { theme: 'dark' | 'light'; onSetTheme: (t: 'dark' | 'light') => void; heatmap: boolean; projectNotes: NoteBullet[]; onSetProjectNotes: (n: NoteBullet[]) => void; notesOpen: boolean; onSetNotesOpen: (v: boolean) => void; nodeListRef: React.MutableRefObject<{ id: string; label: string }[]>; navigateToNodeRef: React.MutableRefObject<(nodeId: string) => void> }) {
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const { screenToFlowPosition, setCenter, getZoom, fitView } = useReactFlow();
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [selectedNode, setSelectedNode] = useState<Node | null>(null);
   const [showResults, setShowResults] = useState(false);
+  const [resultsMounted, setResultsMounted] = useState(false);
   const [results, setResults] = useState<AnalysisResult[]>([]);
   const [scenarioTimeSeries, setScenarioTimeSeries] = useState<ScenarioTimeSeries[]>([]);
   const [batteryDischargeSeries, setBatteryDischargeSeries] = useState<Map<string, BatteryTimeSeriesPoint[]>>(new Map());
   const [heatmapMaxLoss, setHeatmapMaxLoss] = useState(0);
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [isCalculating, setIsCalculating] = useState(false);
+  const [autoCalc, setAutoCalc] = useState(true);
+  const [analysisStale, setAnalysisStale] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [projectName, setProjectName] = useState('Untitled Project');
   const [powerStates, setPowerStates] = useState<PowerState[]>([
@@ -178,6 +222,21 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
   const [activeStateId, setActiveStateId] = useState('active');
   const activeStateIdRef = useRef(activeStateId);
   const [activeScenario, setActiveScenario] = useState<VoltageScenario>('nom');
+
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string; nodeLabel: string } | null>(null);
+
+  // Keep nodeListRef and navigateToNodeRef in sync for Sidebar
+  nodeListRef.current = (nodes as Node[])
+    .filter(n => n.type !== 'groupNode' && n.type !== 'textNode')
+    .map(n => ({ id: n.id, label: ((n.data as Record<string, unknown>).label as string) || n.id }));
+
+  navigateToNodeRef.current = (nodeId: string) => {
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return;
+    const w = node.measured?.width ?? node.width ?? 150;
+    const h = node.measured?.height ?? node.height ?? 80;
+    setCenter(node.position.x + w / 2, node.position.y + h / 2, { zoom: getZoom(), duration: 200 });
+  };
 
   // Undo/redo history
   interface Snapshot {
@@ -190,17 +249,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
   const historyIndexRef = useRef(-1);
   const isUndoRedoRef = useRef(false);
 
-  const stripAnalysis = useCallback((nds: Node[]) =>
-    nds.map(n => {
-      const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = n.data as Record<string, unknown>;
-      void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
-      return { ...n, data: rest };
-    }), []);
-
   const pushHistory = useCallback(() => {
     if (isUndoRedoRef.current) return;
     const snap: Snapshot = {
-      nodes: JSON.parse(JSON.stringify(stripAnalysis(nodes))),
+      nodes: JSON.parse(JSON.stringify(nodes)),
       edges: JSON.parse(JSON.stringify(edges)),
       powerStates: JSON.parse(JSON.stringify(powerStates)),
       activeStateId,
@@ -209,7 +261,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     const idx = historyIndexRef.current;
     historyRef.current = [...history.slice(0, idx + 1), snap].slice(-50);
     historyIndexRef.current = historyRef.current.length - 1;
-  }, [nodes, edges, powerStates, activeStateId, stripAnalysis]);
+  }, [nodes, edges, powerStates, activeStateId]);
 
   const pushHistoryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const schedulePushHistory = useCallback(() => {
@@ -217,15 +269,18 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     pushHistoryTimer.current = setTimeout(() => pushHistory(), 300);
   }, [pushHistory]);
 
-  const dataFingerprint = useRef('');
+  const prevNodesRef = useRef(nodes);
+  const prevEdgesRef = useRef(edges);
+  const prevStatesRef = useRef(powerStates);
+  const prevActiveRef = useRef(activeStateId);
   useEffect(() => {
-    const fp = nodes.map(n => {
-      const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = n.data as Record<string, unknown>;
-      void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
-      return n.id + JSON.stringify(rest);
-    }).join('') + edges.map(e => e.source + e.target).join('') + JSON.stringify(powerStates) + activeStateId;
-    if (fp === dataFingerprint.current) return;
-    dataFingerprint.current = fp;
+    const changed = nodes !== prevNodesRef.current || edges !== prevEdgesRef.current
+      || powerStates !== prevStatesRef.current || activeStateId !== prevActiveRef.current;
+    prevNodesRef.current = nodes;
+    prevEdgesRef.current = edges;
+    prevStatesRef.current = powerStates;
+    prevActiveRef.current = activeStateId;
+    if (!changed) return;
     if (isUndoRedoRef.current) {
       isUndoRedoRef.current = false;
       return;
@@ -274,6 +329,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
   // Clipboard for copy/cut/paste
   const clipboardRef = useRef<{ nodes: Node[]; edges: Edge[] } | null>(null);
   const saveProjectRef = useRef<(() => void) | null>(null);
+  const runManualAnalysisRef = useRef<(() => void) | null>(null);
 
   const copySelected = useCallback(() => {
     const selected = (nodes as unknown as Node[]).filter(n => n.selected);
@@ -284,8 +340,8 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     );
     clipboardRef.current = {
       nodes: JSON.parse(JSON.stringify(selected.map(n => {
-        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = n.data as Record<string, unknown>;
-        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
+        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _notes, ...rest } = n.data as Record<string, unknown>;
+        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _notes;
         return { ...n, data: rest };
       }))),
       edges: JSON.parse(JSON.stringify(internalEdges.map(e => ({
@@ -395,6 +451,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
         e.preventDefault();
         setShowSearch(true);
       }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'r') {
+        e.preventDefault();
+        runManualAnalysisRef.current?.();
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -445,8 +505,8 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     for (const n of allNodes) {
       const d = n.data as unknown as PowerNodeData;
       if (d.type === 'load') {
-        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = n.data as Record<string, unknown>;
-        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
+        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _notes, ...rest } = n.data as Record<string, unknown>;
+        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _notes;
         snap[n.id] = rest as unknown as LoadData;
       }
     }
@@ -457,24 +517,26 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     if (newStateId === activeStateIdRef.current) return;
     const currentSnap = snapshotCurrentLoads();
 
-    const enabledSnap: Record<string, boolean> = {};
-    for (const n of nodes as unknown as Node[]) {
-      const d = n.data as unknown as PowerNodeData;
-      if (d.type === 'converter' || d.type === 'series' || d.type === 'load') {
-        enabledSnap[n.id] = (d as { enabled?: boolean }).enabled !== false;
-      }
-    }
-
+    skipAnalysisRef.current = true;
     setPowerStates(prev => {
       const updated = prev.map(s => {
         if (s.id !== activeStateIdRef.current) return s;
         const newLoadSnaps = { ...s.loadSnapshots, ...currentSnap };
-        const newEnabledOv = { ...s.enabledOverrides, ...enabledSnap };
-        if (JSON.stringify(newLoadSnaps) === JSON.stringify(s.loadSnapshots) &&
-            JSON.stringify(newEnabledOv) === JSON.stringify(s.enabledOverrides)) {
+        const prevOv = s.enabledOverrides ?? {};
+        const newEnabledOv = { ...prevOv };
+        let ovChanged = false;
+        for (const n of nodes as unknown as Node[]) {
+          const d = n.data as unknown as PowerNodeData;
+          if (d.type === 'converter' || d.type === 'series' || d.type === 'load') {
+            const cur = (d as { enabled?: boolean }).enabled !== false;
+            const old = n.id in prevOv ? prevOv[n.id] : undefined;
+            if (old !== cur) { newEnabledOv[n.id] = cur; ovChanged = true; }
+          }
+        }
+        if (JSON.stringify(newLoadSnaps) === JSON.stringify(s.loadSnapshots) && !ovChanged) {
           return s;
         }
-        return { ...s, loadSnapshots: newLoadSnaps, enabledOverrides: newEnabledOv };
+        return { ...s, loadSnapshots: newLoadSnaps, enabledOverrides: ovChanged ? newEnabledOv : prevOv };
       });
       if (updated.every((s, i) => s === prev[i])) return prev;
       return updated;
@@ -594,12 +656,28 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
 
   const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (node.type === 'groupNode') return;
-    setSelectedNode(node);
-    setShowResults(false);
     const w = node.measured?.width ?? node.width ?? 150;
     const h = node.measured?.height ?? node.height ?? 80;
-    setCenter(node.position.x + w / 2, node.position.y + h / 2, { zoom: getZoom(), duration: 300 });
+    setCenter(node.position.x + w / 2, node.position.y + h / 2, { zoom: getZoom(), duration: 200 });
+    requestAnimationFrame(() => {
+      setShowResults(false);
+      setSelectedNode(node);
+    });
   }, [setCenter, getZoom]);
+
+  const onNodeContextMenu = useCallback((e: React.MouseEvent, node: Node) => {
+    if (node.type === 'groupNode' || node.type === 'textNode') return;
+    e.preventDefault();
+    const label = ((node.data as Record<string, unknown>).label as string) || node.id;
+    setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id, nodeLabel: label });
+  }, []);
+
+  const addNoteForNode = useCallback((nId: string) => {
+    const bullet: NoteBullet = { id: crypto.randomUUID(), text: '', nodeId: nId };
+    onSetProjectNotes([...projectNotes, bullet]);
+    onSetNotesOpen(true);
+    setContextMenu(null);
+  }, [projectNotes, onSetProjectNotes, onSetNotesOpen]);
 
   const onTextNodeChange = useCallback((nodeId: string, updates: Record<string, unknown>) => {
     setNodes(nds => nds.map(n => {
@@ -616,10 +694,24 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     setSelectedNode(prev => prev && prev.id === nodeId ? { ...prev, data: { ...prev.data, ...updates } } : prev);
   }, [setNodes]);
 
+  useEffect(() => {
+    if (showResults && results.length > 0) {
+      setResultsMounted(true);
+    } else {
+      const id = setTimeout(() => setResultsMounted(false), 2000);
+      return () => clearTimeout(id);
+    }
+  }, [showResults, results.length]);
+
+  const closeResults = useCallback(() => setShowResults(false), []);
+
   const onPaneClick = useCallback(() => {
     setSelectedNode(null);
     setShowResults(false);
+    setContextMenu(null);
   }, []);
+
+  const closeConfigPanel = useCallback(() => setSelectedNode(null), []);
 
   const onNodesDelete = useCallback((deleted: Node[]) => {
     setSelectedNode(prev => {
@@ -634,7 +726,18 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
       const switchEnabled = isSwitch ? (data as { enabled?: boolean }).enabled !== false : true;
 
       setNodes(nds => {
-        const updated = nds.map(n => (n.id === id ? { ...n, data } : n));
+        let changed = false;
+        const updated = nds.map(n => {
+          if (n.id !== id) return n;
+          const prev = n.data as Record<string, unknown>;
+          const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...prevRest } = prev;
+          const { _analysis: _a2, _activeStateId: _s2, _activeScenario: _sc2, _heatmap: _h2, _maxLoss: _m2, ...newRest } = data as unknown as Record<string, unknown>;
+          void _a2; void _s2; void _sc2; void _h2; void _m2;
+          if (JSON.stringify(prevRest) === JSON.stringify(newRest)) return n;
+          changed = true;
+          return { ...n, data: { ...data, _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss } };
+        });
+        if (!changed) return nds;
         if (isSwitch) {
           const descendants = new Set<string>();
           const walk = (nid: string) => {
@@ -658,6 +761,13 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
         return updated;
       });
       setSelectedNode(prev => (prev && prev.id === id ? { ...prev, data } : prev));
+      setResults(prev => {
+        const old = prev.find(r => r.nodeId === id);
+        if (old && old.label !== data.label) {
+          return prev.map(r => r.nodeId === id ? { ...r, label: data.label } : r);
+        }
+        return prev;
+      });
       if (data.type === 'load') {
         setPowerStates(prev => prev.map(s =>
           s.id === activeStateIdRef.current
@@ -704,7 +814,6 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
   // Auto-run analysis whenever nodes or edges change (fingerprint prevents redundant runs).
   // Fingerprint computation is deferred so selection-only changes don't block the UI.
   const ANALYSIS_VERSION = 15;
-  const analysisFingerprint = useRef('');
 
   const runAnalysis = useRef<() => void>();
   runAnalysis.current = () => {
@@ -736,88 +845,175 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     const heatVal = (res: AnalysisResult) => res.type === 'load' ? res.inputPowerAvg : (res.powerLossAvg + (res.auxPowerAvg ?? 0));
     const maxLoss = Math.max(...r.map(heatVal), 0);
     setHeatmapMaxLoss(maxLoss);
-    setNodes(nds => nds.map(n => {
-      const res = resultMap.get(n.id);
-      return { ...n, data: { ...n.data, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
-    }));
+    setNodes(nds => {
+      let changed = false;
+      const updated = nds.map(n => {
+        const d = n.data as Record<string, unknown>;
+        const res = resultMap.get(n.id);
+        if (d._analysis === res && d._activeStateId === activeStateId
+          && d._activeScenario === activeScenario && d._heatmap === heatmap && d._maxLoss === maxLoss) {
+          return n;
+        }
+        changed = true;
+        return { ...n, data: { ...d, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
+      });
+      return changed ? updated : nds;
+    });
 
     const edgeColors = theme === 'light'
       ? { active: '#2A9D8F', disabled: '#C5BFAE', labelDim: '#999', labelNorm: '#7A7568', labelBg: '#FEFCF8' }
       : { active: '#4ECDC4', disabled: '#3A3E48', labelDim: '#555', labelNorm: '#8B8F9A', labelBg: '#1E222A' };
 
-    setEdges(eds => eds.map(e => {
-      const sourceResult = resultMap.get(e.source);
-      const targetResult = resultMap.get(e.target);
-      const isEdgeDisabled = sourceResult?.disabled === true || targetResult?.disabled === true;
-      const scenarioStates = activeScenario ? targetResult?.scenarioStateResults?.[activeScenario] : undefined;
-      const stateRes = scenarioStates?.[activeStateId] ?? targetResult?.stateResults?.[activeStateId];
-      const currentA = stateRes?.currentOut ?? targetResult?.currentOut ?? 0;
-      let label: string;
-      if (currentA >= 1) label = `${currentA.toFixed(2)} A`;
-      else if (currentA >= 0.001) label = `${(currentA * 1000).toFixed(1)} mA`;
-      else if (currentA > 0) label = `${(currentA * 1e6).toFixed(0)} uA`;
-      else label = '0 mA';
+    const curState = powerStates.find(s => s.id === activeStateId);
+    const stateOff = new Set<string>();
+    if (curState) {
+      const nm = new Map(nodes.map(n => [n.id, n]));
+      const pm = new Map<string, string>();
+      for (const e of edges) pm.set(e.target, e.source);
+      const oc = new Map<string, boolean>();
+      const isOff = (nid: string): boolean => {
+        if (oc.has(nid)) return oc.get(nid)!;
+        const nd = nm.get(nid);
+        if (!nd) { oc.set(nid, false); return false; }
+        const d = nd.data as Record<string, unknown>;
+        const nt = d.type as string;
+        let off = false;
+        if (nt === 'series' || nt === 'converter' || nt === 'load') {
+          if (curState.enabledOverrides && nid in curState.enabledOverrides) {
+            off = !curState.enabledOverrides[nid];
+          } else if ((d as { enabled?: boolean }).enabled === false) {
+            off = true;
+          }
+        }
+        if (!off) {
+          const pid = pm.get(nid);
+          if (pid) off = isOff(pid);
+        }
+        oc.set(nid, off);
+        return off;
+      };
+      for (const n of nodes) {
+        if (isOff(n.id)) stateOff.add(n.id);
+      }
+    }
 
-      const edgeStyle = isEdgeDisabled
-        ? { stroke: edgeColors.disabled, strokeWidth: 1.5, strokeDasharray: '6 3' }
-        : { stroke: edgeColors.active, strokeWidth: 2 };
-      const animated = !isEdgeDisabled;
-      const labelFill = isEdgeDisabled ? edgeColors.labelDim : edgeColors.labelNorm;
+    setEdges(eds => {
+      let eChanged = false;
+      const updatedEdges = eds.map(e => {
+        const sourceResult = resultMap.get(e.source);
+        const targetResult = resultMap.get(e.target);
+        const isEdgeDisabled = stateOff.has(e.source) || stateOff.has(e.target)
+          || sourceResult?.disabled === true || targetResult?.disabled === true;
+        const scenarioStates = activeScenario ? targetResult?.scenarioStateResults?.[activeScenario] : undefined;
+        const stateRes = scenarioStates?.[activeStateId] ?? targetResult?.stateResults?.[activeStateId];
+        const currentA = stateRes?.currentOut ?? targetResult?.currentOut ?? 0;
+        let label: string;
+        if (currentA >= 1) label = `${currentA.toFixed(2)} A`;
+        else if (currentA >= 0.001) label = `${(currentA * 1000).toFixed(1)} mA`;
+        else if (currentA > 0) label = `${(currentA * 1e6).toFixed(0)} uA`;
+        else label = '0 mA';
 
-      return { ...e, label, animated, style: edgeStyle,
-        labelStyle: { fill: labelFill, fontSize: 10, fontWeight: 600 },
-        labelBgStyle: { fill: edgeColors.labelBg, fillOpacity: 0.9 },
-        labelBgPadding: [4, 2] as [number, number] };
-    }));
+        if (e.label === label && e.animated === !isEdgeDisabled) return e;
+        eChanged = true;
+
+        const edgeStyle = isEdgeDisabled
+          ? { stroke: edgeColors.disabled, strokeWidth: 1.5, strokeDasharray: '6 3' }
+          : { stroke: edgeColors.active, strokeWidth: 2 };
+        const labelFill = isEdgeDisabled ? edgeColors.labelDim : edgeColors.labelNorm;
+
+        return { ...e, label, animated: !isEdgeDisabled, style: edgeStyle,
+          labelStyle: { fill: labelFill, fontSize: 10, fontWeight: 600 },
+          labelBgStyle: { fill: edgeColors.labelBg, fillOpacity: 0.9 },
+          labelBgPadding: [4, 2] as [number, number] };
+      });
+      return eChanged ? updatedEdges : eds;
+    });
     setIsCalculating(false);
   };
 
-  const nodeFpCache = useRef(new WeakMap<Record<string, unknown>, string>());
-  const edgesFpCache = useRef({ ref: edges, fp: '' });
-  const statesFpCache = useRef({ ref: powerStates, fp: '' });
+  const analysisRafRef = useRef<number>(0);
+  const skipAnalysisRef = useRef(false);
+  const autoCalcRef = useRef(autoCalc);
+  autoCalcRef.current = autoCalc;
+
+  const toggleAutoCalc = useCallback(() => {
+    setAutoCalc(prev => {
+      const next = !prev;
+      if (next) {
+        setAnalysisStale(stale => {
+          if (stale) {
+            if (analysisRafRef.current) cancelAnimationFrame(analysisRafRef.current);
+            setIsCalculating(true);
+            analysisRafRef.current = requestAnimationFrame(() => {
+              analysisRafRef.current = requestAnimationFrame(() => {
+                analysisRafRef.current = 0;
+                runAnalysis.current?.();
+              });
+            });
+          }
+          return false;
+        });
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
-    const cache = nodeFpCache.current;
+    const skip = skipAnalysisRef.current;
+    if (skip) skipAnalysisRef.current = false;
+
+    const cache = _nodeFpCache;
     const nodeParts: string[] = [];
     for (const n of nodes) {
       if (n.type === 'groupNode' || n.type === 'textNode') continue;
       const d = n.data as Record<string, unknown>;
       let cached = cache.get(d);
       if (!cached) {
-        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, enabled: _en, ...rest } = d;
-        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _en;
-        const nodeType = (d as unknown as PowerNodeData).type;
-        cached = nodeType === 'load'
-          ? n.id + ':' + nodeType + ':' + (rest.label ?? '')
-          : n.id + ':' + JSON.stringify(rest);
+        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _notes, enabled: _en, label: _lbl, ...rest } = d;
+        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _notes; void _en; void _lbl;
+        cached = n.id + ':' + JSON.stringify(rest);
         cache.set(d, cached);
       }
       nodeParts.push(cached);
     }
-    if (edgesFpCache.current.ref !== edges) {
-      edgesFpCache.current = { ref: edges, fp: edges.map(e => e.source + '-' + e.target).join('|') };
+    if (_edgesFpCache.ref !== edges) {
+      _edgesFpCache = { ref: edges, fp: edges.map(e => e.source + '-' + e.target).join('|') };
     }
-    if (statesFpCache.current.ref !== powerStates) {
-      statesFpCache.current = { ref: powerStates, fp: JSON.stringify(powerStates) };
+    if (_statesFpCache.ref !== powerStates) {
+      _statesFpCache = { ref: powerStates, fp: JSON.stringify(powerStates) };
     }
-    const fp = nodeParts.join('|') + '||' + edgesFpCache.current.fp
-      + '||' + statesFpCache.current.fp + '||' + theme + '||' + heatmap + '||v' + ANALYSIS_VERSION;
+    const fp = nodeParts.join('|') + '||' + _edgesFpCache.fp
+      + '||' + _statesFpCache.fp + '||v' + ANALYSIS_VERSION;
 
-    if (fp === analysisFingerprint.current) return;
-    analysisFingerprint.current = fp;
+    if (fp === _analysisFingerprint) return;
+    _analysisFingerprint = fp;
+    if (skip) return;
 
     if (nodes.length === 0) {
       setResults([]);
       setScenarioTimeSeries([]);
       setBatteryDischargeSeries(new Map());
       setDiagnostics([]);
+      setAnalysisStale(false);
       return;
     }
 
+    if (!autoCalcRef.current) {
+      setAnalysisStale(true);
+      return;
+    }
+
+    setAnalysisStale(false);
+    if (analysisRafRef.current) cancelAnimationFrame(analysisRafRef.current);
     setIsCalculating(true);
-    requestAnimationFrame(() => { runAnalysis.current?.(); });
+    analysisRafRef.current = requestAnimationFrame(() => {
+      analysisRafRef.current = requestAnimationFrame(() => {
+        analysisRafRef.current = 0;
+        runAnalysis.current?.();
+      });
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, edges, powerStates, theme, heatmap]);
+  }, [nodes, edges, powerStates]);
 
   // Re-inject display props when activeScenario or activeStateId changes (no re-analysis needed)
   useEffect(() => {
@@ -825,17 +1021,65 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     const resultMap = new Map(results.map(res => [res.nodeId, res]));
     const heatVal = (res: AnalysisResult) => res.type === 'load' ? res.inputPowerAvg : (res.powerLossAvg + (res.auxPowerAvg ?? 0));
     const maxLoss = Math.max(...results.map(heatVal), 0);
-    setNodes(nds => nds.map(n => {
-      const res = resultMap.get(n.id);
-      return { ...n, data: { ...n.data, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
-    }));
+    setNodes(nds => {
+      let changed = false;
+      const updated = nds.map(n => {
+        const d = n.data as Record<string, unknown>;
+        const res = resultMap.get(n.id);
+        if (d._analysis === res && d._activeStateId === activeStateId
+          && d._activeScenario === activeScenario && d._heatmap === heatmap && d._maxLoss === maxLoss) {
+          return n;
+        }
+        changed = true;
+        return { ...n, data: { ...n.data, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
+      });
+      return changed ? updated : nds;
+    });
 
     const edgeColors = theme === 'light'
       ? { active: '#2A9D8F', disabled: '#C5BFAE', labelDim: '#999', labelNorm: '#7A7568', labelBg: '#FEFCF8' }
       : { active: '#4ECDC4', disabled: '#3A3E48', labelDim: '#555', labelNorm: '#8B8F9A', labelBg: '#1E222A' };
+
+    // Build per-state disabled set: a node is disabled in this state if its
+    // enabledOverride is false (or base enabled is false with no override),
+    // OR if any ancestor in the tree is disabled in this state.
+    const activeState = powerStates.find(s => s.id === activeStateId);
+    const stateDisabled = new Set<string>();
+    if (activeState) {
+      const nodeMap = new Map(nodes.map(n => [n.id, n]));
+      const parentMap = new Map<string, string>();
+      for (const e of edges) parentMap.set(e.target, e.source);
+      const cache = new Map<string, boolean>();
+      const isNodeOffInState = (nid: string): boolean => {
+        if (cache.has(nid)) return cache.get(nid)!;
+        const nd = nodeMap.get(nid);
+        if (!nd) { cache.set(nid, false); return false; }
+        const d = nd.data as Record<string, unknown>;
+        const nodeType = d.type as string;
+        let off = false;
+        if (nodeType === 'series' || nodeType === 'converter' || nodeType === 'load') {
+          if (activeState.enabledOverrides && nid in activeState.enabledOverrides) {
+            off = !activeState.enabledOverrides[nid];
+          } else if ((d as { enabled?: boolean }).enabled === false) {
+            off = true;
+          }
+        }
+        if (!off) {
+          const pid = parentMap.get(nid);
+          if (pid) off = isNodeOffInState(pid);
+        }
+        cache.set(nid, off);
+        return off;
+      };
+      for (const n of nodes) {
+        if (isNodeOffInState(n.id)) stateDisabled.add(n.id);
+      }
+    }
+
     setEdges(eds => eds.map(e => {
       const targetResult = resultMap.get(e.target);
-      const isEdgeDisabled = resultMap.get(e.source)?.disabled === true || targetResult?.disabled === true;
+      const isEdgeDisabled = stateDisabled.has(e.source) || stateDisabled.has(e.target)
+        || resultMap.get(e.source)?.disabled === true || targetResult?.disabled === true;
       const scenarioStates = activeScenario ? targetResult?.scenarioStateResults?.[activeScenario] : undefined;
       const stateRes = scenarioStates?.[activeStateId] ?? targetResult?.stateResults?.[activeStateId];
       const currentA = stateRes?.currentOut ?? targetResult?.currentOut ?? 0;
@@ -844,18 +1088,49 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
       else if (currentA >= 0.001) label = `${(currentA * 1000).toFixed(1)} mA`;
       else if (currentA > 0) label = `${(currentA * 1e6).toFixed(0)} uA`;
       else label = '0 mA';
+      const edgeStyle = isEdgeDisabled
+        ? { stroke: edgeColors.disabled, strokeWidth: 1.5, strokeDasharray: '6 3' }
+        : { stroke: edgeColors.active, strokeWidth: 2 };
+      const animated = !isEdgeDisabled;
       const labelFill = isEdgeDisabled ? edgeColors.labelDim : edgeColors.labelNorm;
-      return { ...e, label,
+      return { ...e, label, animated, style: edgeStyle,
         labelStyle: { fill: labelFill, fontSize: 10, fontWeight: 600 },
         labelBgStyle: { fill: edgeColors.labelBg, fillOpacity: 0.9 },
         labelBgPadding: [4, 2] as [number, number] };
     }));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenario, activeStateId]);
+  }, [activeScenario, activeStateId, theme, heatmap]);
+
+  // Inject _notes into node data for PowerNode rendering
+  useEffect(() => {
+    const notesByNode = new Map<string, string[]>();
+    for (const b of projectNotes) {
+      if (b.nodeId && b.text.trim()) {
+        const arr = notesByNode.get(b.nodeId);
+        if (arr) arr.push(b.text);
+        else notesByNode.set(b.nodeId, [b.text]);
+      }
+    }
+    setNodes(nds => {
+      let changed = false;
+      const updated = nds.map(n => {
+        const d = n.data as Record<string, unknown>;
+        const notes = notesByNode.get(n.id) ?? null;
+        const prev = (d._notes as string[] | null) ?? null;
+        if (notes === prev || (notes && prev && notes.length === prev.length && notes.every((t, i) => t === prev[i]))) return n;
+        changed = true;
+        return { ...n, data: { ...n.data, _notes: notes } };
+      });
+      return changed ? updated : nds;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectNotes]);
 
   const resetProject = useCallback(() => {
-    analysisFingerprint.current = '';
-    nodeFpCache.current = new WeakMap();
+    _analysisFingerprint = '';
+    _nodeFpCache = new WeakMap();
+    _edgesFpCache = { ref: null, fp: '' };
+    _statesFpCache = { ref: null, fp: '' };
     setNodes([]);
     setEdges([]);
     setSelectedNode(null);
@@ -865,6 +1140,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     setScenarioTimeSeries([]);
     setBatteryDischargeSeries(new Map());
     setProjectName('Untitled Project');
+    onSetProjectNotes([]);
     setPowerStates([
       { id: 'active', name: 'Active', fractionOfTime: 0.5, loadSnapshots: {} },
       { id: 'sleep', name: 'Sleep', fractionOfTime: 0.5, loadSnapshots: {} },
@@ -907,11 +1183,23 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
   }, [showSaveConfirm, resetProject]);
 
   const openResults = useCallback(() => {
-    analysisFingerprint.current = '';
-    nodeFpCache.current = new WeakMap();
     setShowResults(true);
     setSelectedNode(null);
   }, []);
+
+  const runManualAnalysis = useCallback(() => {
+    if (nodes.length === 0) return;
+    setAnalysisStale(false);
+    if (analysisRafRef.current) cancelAnimationFrame(analysisRafRef.current);
+    setIsCalculating(true);
+    analysisRafRef.current = requestAnimationFrame(() => {
+      analysisRafRef.current = requestAnimationFrame(() => {
+        analysisRafRef.current = 0;
+        runAnalysis.current?.();
+      });
+    });
+  }, [nodes.length]);
+  runManualAnalysisRef.current = runManualAnalysis;
 
   const fileHandleRef = useRef<FileSystemFileHandle | null>(null);
 
@@ -933,13 +1221,14 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
     );
 
     const stripped = nodes.map(n => {
-      const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...rest } = n.data as Record<string, unknown>;
-      void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss;
+      const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _notes, ...rest } = n.data as Record<string, unknown>;
+      void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _notes;
       return { ...n, data: rest };
     });
     return JSON.stringify({
       version: 4,
       projectName,
+      notes: projectNotes,
       theme,
       activeScenario,
       powerStates: savedPowerStates,
@@ -958,7 +1247,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
         targetHandle: e.targetHandle,
       })),
     }, null, 2);
-  }, [nodes, edges, powerStates, projectName, theme, activeScenario, snapshotCurrentLoads]);
+  }, [nodes, edges, powerStates, projectName, projectNotes, theme, activeScenario, snapshotCurrentLoads]);
 
   const [saveToast, setSaveToast] = useState(false);
   const showSaveToast = useCallback(() => {
@@ -1092,6 +1381,13 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
       setShowResults(false);
 
       if (project.projectName) setProjectName(project.projectName);
+      if (Array.isArray(project.notes)) {
+        onSetProjectNotes(project.notes);
+      } else if (typeof project.notes === 'string' && project.notes.trim()) {
+        onSetProjectNotes(project.notes.split('\n').filter((l: string) => l.trim()).map((l: string) => ({ id: crypto.randomUUID(), text: l.trim() })));
+      } else {
+        onSetProjectNotes([]);
+      }
       if (project.theme) onSetTheme(project.theme);
       if (project.activeScenario) setActiveScenario(project.activeScenario);
 
@@ -1105,8 +1401,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
 
       syncNodeIdCounter(resolvedNodes);
 
-      analysisFingerprint.current = '';
-      nodeFpCache.current = new WeakMap();
+      _analysisFingerprint = '';
+      _nodeFpCache = new WeakMap();
+      _edgesFpCache = { ref: null, fp: '' };
+      _statesFpCache = { ref: null, fp: '' };
     } catch {
       alert('Invalid project file.');
     }
@@ -1219,44 +1517,49 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
       <div className="main-area">
         <div className="toolbar">
           <div className="toolbar-left">
-            <input
-              className="project-name-input"
-              value={projectName}
-              onChange={e => setProjectName(e.target.value)}
-              spellCheck={false}
-            />
+            <Tooltip text="Project name — click to rename">
+              <input
+                className="project-name-input"
+                value={projectName}
+                onChange={e => setProjectName(e.target.value)}
+                spellCheck={false}
+              />
+            </Tooltip>
           </div>
           <div className="toolbar-actions">
-            <button className="toolbar-btn secondary" onClick={newProject}>
-              New
-            </button>
-            <button className="toolbar-btn secondary" onClick={loadProject}>
-              Load
-            </button>
-            <button className="toolbar-btn secondary" onClick={saveProject} disabled={nodes.length === 0}>
-              Save
-            </button>
-            <button className="toolbar-btn secondary" onClick={saveAsProject} disabled={nodes.length === 0}>
-              Save As
-            </button>
-            <button className="analyze-btn" onClick={openResults} disabled={nodes.length === 0}>
-              Details
-            </button>
+            <Tooltip text="Create a new empty project (unsaved changes will prompt to save)">
+              <button className="toolbar-btn secondary" onClick={newProject}>New</button>
+            </Tooltip>
+            <Tooltip text="Open a saved project file (.json)">
+              <button className="toolbar-btn secondary" onClick={loadProject}>Load</button>
+            </Tooltip>
+            <Tooltip text="Save to the current file (Cmd+S)">
+              <button className="toolbar-btn secondary" onClick={saveProject} disabled={nodes.length === 0}>Save</button>
+            </Tooltip>
+            <Tooltip text="Save as a new file">
+              <button className="toolbar-btn secondary" onClick={saveAsProject} disabled={nodes.length === 0}>Save As</button>
+            </Tooltip>
+            <Tooltip text="Open the analysis results panel with power, loss, and efficiency breakdowns">
+              <button className="analyze-btn" onClick={openResults} disabled={nodes.length === 0}>Details</button>
+            </Tooltip>
           </div>
         </div>
         {saveToast && <div className="save-toast">Saved</div>}
         <div className="state-tabs-bar">
           {powerStates.map(s => (
-            <button
-              key={s.id}
-              className={`state-tab ${activeStateId === s.id ? 'active' : ''}`}
-              onClick={() => switchState(s.id)}
-            >
-              {s.name}
-              <span className="state-tab-pct">{(s.fractionOfTime * 100).toFixed(0)}%</span>
-            </button>
+            <Tooltip key={s.id} text={`Switch to ${s.name} (${(s.fractionOfTime * 100).toFixed(0)}% duty cycle). Each state can have different load values and enabled/disabled components.`}>
+              <button
+                className={`state-tab ${activeStateId === s.id ? 'active' : ''}`}
+                onClick={() => switchState(s.id)}
+              >
+                {s.name}
+                <span className="state-tab-pct">{(s.fractionOfTime * 100).toFixed(0)}%</span>
+              </button>
+            </Tooltip>
           ))}
-          <button className="state-tab state-tab-manage" onClick={() => setShowStateManager(true)}>Manage States</button>
+          <Tooltip text="Add, remove, or rename power states and adjust their duty cycle percentages">
+            <button className="state-tab state-tab-manage" onClick={() => setShowStateManager(true)}>Manage States</button>
+          </Tooltip>
           {(() => {
             let hasMin = false, hasMax = false;
             for (const n of nodes) {
@@ -1269,14 +1572,39 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
             }
             if (!hasMin && !hasMax) return null;
             return (
-              <div className="scenario-toggle">
-                <span className="scenario-label">Vin:</span>
-                {hasMin && <button className={`scenario-btn ${activeScenario === 'min' ? 'active' : ''}`} onClick={() => setActiveScenario(activeScenario === 'min' ? 'nom' : 'min')}>Min</button>}
-                <button className={`scenario-btn ${activeScenario === 'nom' ? 'active' : ''}`} onClick={() => setActiveScenario('nom')}>Nom</button>
-                {hasMax && <button className={`scenario-btn ${activeScenario === 'max' ? 'active' : ''}`} onClick={() => setActiveScenario(activeScenario === 'max' ? 'nom' : 'max')}>Max</button>}
-              </div>
+              <Tooltip text="Switch between min, nominal, and max input voltage scenarios defined on your power sources">
+                <div className="scenario-toggle">
+                  <span className="scenario-label">Vin:</span>
+                  {hasMin && <button className={`scenario-btn ${activeScenario === 'min' ? 'active' : ''}`} onClick={() => setActiveScenario(activeScenario === 'min' ? 'nom' : 'min')}>Min</button>}
+                  <button className={`scenario-btn ${activeScenario === 'nom' ? 'active' : ''}`} onClick={() => setActiveScenario('nom')}>Nom</button>
+                  {hasMax && <button className={`scenario-btn ${activeScenario === 'max' ? 'active' : ''}`} onClick={() => setActiveScenario(activeScenario === 'max' ? 'nom' : 'max')}>Max</button>}
+                </div>
+              </Tooltip>
             );
           })()}
+          <div className="auto-calc-spacer" />
+          <div className="auto-calc-group">
+            <Tooltip text="When on, analysis runs automatically after every change. Turn off to batch edits and recalculate manually when ready.">
+              <label className="auto-calc-label">
+                <span className="auto-calc-text">Auto-calculate</span>
+                <button
+                  className={`toggle-switch ${autoCalc ? 'on' : 'off'}`}
+                  onClick={toggleAutoCalc}
+                  role="switch"
+                  aria-checked={autoCalc}
+                >
+                  <span className="toggle-knob" />
+                </button>
+              </label>
+            </Tooltip>
+            {!autoCalc && (
+              <Tooltip text="Run analysis now with the current parameters (Cmd+Shift+R)">
+                <button className="recalc-btn" onClick={runManualAnalysis} disabled={!analysisStale}>
+                  Recalculate
+                </button>
+              </Tooltip>
+            )}
+          </div>
         </div>
         <div className="flow-container" ref={reactFlowWrapper}>
           <ReactFlow
@@ -1288,6 +1616,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
             onDrop={onDrop}
             onDragOver={onDragOver}
             onNodeClick={onNodeClick}
+            onNodeContextMenu={onNodeContextMenu}
             onPaneClick={onPaneClick}
             onNodesDelete={onNodesDelete}
             nodeTypes={nodeTypes}
@@ -1309,6 +1638,20 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
           </ReactFlow>
           {heatmap && heatmapMaxLoss > 0 && <HeatmapScale maxLoss={heatmapMaxLoss} />}
           {isCalculating && <div className="calc-toast"><span className="calc-toast-spinner" />Calculating…</div>}
+          {!isCalculating && analysisStale && !autoCalc && (
+            <div className="calc-toast stale-toast" onClick={runManualAnalysis} style={{ cursor: 'pointer' }}>
+              Changes pending — click to recalculate
+            </div>
+          )}
+          {contextMenu && (
+            <div className="ctx-menu-overlay" onClick={() => setContextMenu(null)} onContextMenu={e => { e.preventDefault(); setContextMenu(null); }}>
+              <div className="ctx-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={e => e.stopPropagation()}>
+                <button className="ctx-menu-item" onClick={() => addNoteForNode(contextMenu.nodeId)}>
+                  Add note for "{contextMenu.nodeLabel}"
+                </button>
+              </div>
+            </div>
+          )}
         </div>
         <DiagnosticsConsole
           diagnostics={diagnostics}
@@ -1399,23 +1742,25 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
         <ConfigPanel
           node={selectedNode}
           onUpdate={updateNodeData}
-          onClose={() => setSelectedNode(null)}
+          onClose={closeConfigPanel}
           onDelete={deleteNode}
           auxOverrides={powerStates.find(s => s.id === activeStateId)?.auxLoadOverrides?.[selectedNode.id]}
           onAuxOverrideToggle={onAuxOverrideToggle}
         />
       )}
 
-      {showResults && (
-        <ResultsPanel
-          results={results}
-          scenarioTimeSeries={scenarioTimeSeries}
-          batteryDischargeSeries={batteryDischargeSeries}
-          onClose={() => setShowResults(false)}
-          powerStates={powerStates}
-          activeStateId={activeStateId}
-          theme={theme}
-        />
+      {resultsMounted && (
+        <div style={showResults && !selectedNode ? { display: 'flex', height: '100%' } : { display: 'none' }}>
+          <ResultsPanel
+            results={results}
+            scenarioTimeSeries={scenarioTimeSeries}
+            batteryDischargeSeries={batteryDischargeSeries}
+            onClose={closeResults}
+            powerStates={powerStates}
+            activeStateId={activeStateId}
+            theme={theme}
+          />
+        </div>
       )}
 
       {showSaveConfirm && (
@@ -1450,32 +1795,23 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
                     onChange={e => renameState(s.id, e.target.value)}
                     className="state-name-input"
                   />
-                  <label className="state-fraction-label">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={(s.fractionOfTime * 100).toFixed(0)}
-                      onChange={e => {
-                        const v = parseFloat(e.target.value);
-                        if (!isNaN(v)) updateStateFraction(s.id, v / 100);
-                      }}
-                      onBlur={e => {
-                        if (e.target.value === '') updateStateFraction(s.id, 0);
-                      }}
-                    />
-                    %
-                  </label>
-                  <button
-                    className="state-copy-btn"
-                    onClick={() => copyPowerState(s.id)}
-                    title="Duplicate state"
-                  >Copy</button>
-                  <button
-                    className="state-remove-btn"
-                    onClick={() => removePowerState(s.id)}
-                    disabled={powerStates.length <= 1}
-                    title="Remove state"
-                  >X</button>
+                  <FractionInput
+                    value={s.fractionOfTime}
+                    onChange={v => updateStateFraction(s.id, v)}
+                  />
+                  <Tooltip text="Duplicate this state with the same settings">
+                    <button
+                      className="state-copy-btn"
+                      onClick={() => copyPowerState(s.id)}
+                    >Copy</button>
+                  </Tooltip>
+                  <Tooltip text="Remove this state">
+                    <button
+                      className="state-remove-btn"
+                      onClick={() => removePowerState(s.id)}
+                      disabled={powerStates.length <= 1}
+                    >X</button>
+                  </Tooltip>
                 </div>
               ))}
               <div className="state-add-row">
@@ -1506,6 +1842,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap }: { theme: 'dark' | 'light'; o
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
   const [heatmap, setHeatmap] = useState(false);
+  const [projectNotes, setProjectNotes] = useState<NoteBullet[]>([]);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const nodeListRef = useRef<{ id: string; label: string }[]>([]);
+  const navigateToNodeRef = useRef<(nodeId: string) => void>(() => {});
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -1518,9 +1858,15 @@ export default function App() {
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         heatmap={heatmap}
         onToggleHeatmap={() => setHeatmap(h => !h)}
+        notes={projectNotes}
+        onNotesChange={setProjectNotes}
+        notesOpen={notesOpen}
+        onNotesOpenChange={setNotesOpen}
+        nodeList={nodeListRef}
+        onNodeNavigate={navigateToNodeRef}
       />
       <ReactFlowProvider>
-        <FlowCanvas theme={theme} onSetTheme={setTheme} heatmap={heatmap} />
+        <FlowCanvas theme={theme} onSetTheme={setTheme} heatmap={heatmap} projectNotes={projectNotes} onSetProjectNotes={setProjectNotes} notesOpen={notesOpen} onSetNotesOpen={setNotesOpen} nodeListRef={nodeListRef} navigateToNodeRef={navigateToNodeRef} />
       </ReactFlowProvider>
     </div>
   );
