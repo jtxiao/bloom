@@ -801,6 +801,7 @@ body {
   flex: 1;
   padding: 12px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .config-footer {
@@ -1028,6 +1029,7 @@ button.file-label:hover {
   color: var(--text);
   font-size: 12px;
   outline: none;
+  min-width: 0;
 }
 
 .eff-add input:focus {

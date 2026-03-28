@@ -184,6 +184,50 @@ function getSeriesLoss(sd: SeriesElementData, current: number): number {
   return current * current * (sd.resistance || 0);
 }
 
+function sumTreeCurrent(
+  nodeId: string, nodes: Map<string, Node>, edges: Edge[],
+  timeIdx: number, allTimes: number[], sourceVoltages: Map<string, number>,
+  auxOverrides?: Record<string, Record<string, boolean>>
+): number {
+  const node = nodes.get(nodeId);
+  if (!node) return 0;
+  const data = node.data as unknown as PowerNodeData;
+
+  if (data.type === 'load') {
+    if ((data as LoadData).enabled === false) return 0;
+    const lv = resolveInputVoltageWithSeriesDrop(nodeId, nodes, edges, sourceVoltages, timeIdx, allTimes, auxOverrides);
+    return lv > 0 ? getLoadCurrent(data as LoadData, allTimes[timeIdx], lv) : 0;
+  }
+  if (data.type === 'converter') {
+    if ((data as PowerConverterData).enabled === false) return 0;
+    return getNodeCurrentDraw(nodeId, nodes, edges, timeIdx, allTimes, sourceVoltages, auxOverrides);
+  }
+  if (data.type === 'series') {
+    if ((data as SeriesElementData).enabled === false) return 0;
+  }
+
+  let total = 0;
+  for (const childId of getChildren(nodeId, edges)) {
+    total += sumTreeCurrent(childId, nodes, edges, timeIdx, allTimes, sourceVoltages, auxOverrides);
+  }
+
+  if (data.type === 'series') {
+    const sd = data as SeriesElementData;
+    const upstreamV = resolveInputVoltageWithSeriesDrop(nodeId, nodes, edges, sourceVoltages, timeIdx, allTimes, auxOverrides);
+    const r = sd.resistance || 0;
+    const vOut = sd.seriesMode === 'diode'
+      ? Math.max(0, upstreamV - (sd.forwardVoltage || 0))
+      : Math.max(0, upstreamV - total * r);
+    total += getAuxLoadCurrent(sd.auxLoads, vOut, auxOverrides?.[nodeId]);
+  } else if (data.type === 'source') {
+    const sd = data as PowerSourceData;
+    const sv = sourceVoltages.get(nodeId) ?? sd.nominalVoltage;
+    total += getAuxLoadCurrent(sd.auxLoads, sv, auxOverrides?.[nodeId]);
+  }
+
+  return total;
+}
+
 function getAuxLoadCurrent(
   auxLoads: AuxLoad[] | undefined,
   voltage: number,
@@ -1127,6 +1171,8 @@ function computeNodeStateResult(
       const ld = stateNodeMap.get(nodeId);
       const loadData = ld ? ld.data as unknown as LoadData : d as LoadData;
       stepCurrent = stepVoltageOut > 0 ? getLoadCurrent(loadData, times[ti], stepVoltageOut) : 0;
+    } else if (d.type === 'source' || d.type === 'series') {
+      stepCurrent = sumTreeCurrent(nodeId, stateNodeMap, edges, ti, times, sourceVoltages, auxOverrides);
     } else {
       stepCurrent = getNodeCurrentDraw(nodeId, stateNodeMap, edges, ti, times, sourceVoltages, auxOverrides);
     }
@@ -1157,7 +1203,6 @@ function computeNodeStateResult(
       stepAuxPower = auxI * sv;
     } else if (d.type === 'series') {
       const sd = d as SeriesElementData;
-      // Use the output voltage (after drop) for aux loads on series elements
       const auxI = getAuxLoadCurrent(sd.auxLoads, stepVoltageOut, auxOverrides?.[nodeId]);
       stepAuxPower = auxI * stepVoltageOut;
     }

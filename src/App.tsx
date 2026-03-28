@@ -708,20 +708,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   const closeResults = useCallback(() => setShowResults(false), []);
 
-  const mouseDownPos = useRef<{ x: number; y: number } | null>(null);
-
-  const onFlowMouseDown = useCallback((e: React.MouseEvent) => {
-    mouseDownPos.current = { x: e.clientX, y: e.clientY };
-  }, []);
-
-  const onPaneClick = useCallback((event: unknown) => {
-    const e = event as MouseEvent;
-    const start = mouseDownPos.current;
-    if (start) {
-      const dx = Math.abs(e.clientX - start.x);
-      const dy = Math.abs(e.clientY - start.y);
-      if (dx > 5 || dy > 5) return;
-    }
+  const onPaneClick = useCallback(() => {
     setSelectedNode(null);
     setShowResults(false);
     setContextMenu(null);
@@ -1675,7 +1662,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             )}
           </div>
         </div>
-        <div className="flow-container" ref={reactFlowWrapper} onMouseDown={onFlowMouseDown}>
+        <div className="flow-container" ref={reactFlowWrapper}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
