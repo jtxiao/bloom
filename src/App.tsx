@@ -10,8 +10,9 @@ import {
   useEdgesState,
   useReactFlow,
   ReactFlowProvider,
+  ViewportPortal,
 } from '@xyflow/react';
-import type { Connection, Node, Edge } from '@xyflow/react';
+import type { Connection, Node, Edge, NodeChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
 import PowerNode from './components/PowerNode';
@@ -225,6 +226,11 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   const [activeScenario, setActiveScenario] = useState<VoltageScenario>('nom');
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string; nodeLabel: string } | null>(null);
+  const [alignGuides, setAlignGuides] = useState<{
+    x?: number; y?: number;
+    spacingH?: { x1: number; x2: number; y: number }[];
+    spacingV?: { y1: number; y2: number; x: number }[];
+  }>({});
 
   // Keep nodeListRef and navigateToNodeRef in sync for Sidebar
   nodeListRef.current = (nodes as Node[])
@@ -713,6 +719,192 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     setShowResults(false);
     setContextMenu(null);
   }, []);
+
+  const SNAP_THRESHOLD = 5;
+
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    const posChanges = changes.filter(
+      (c): c is NodeChange & { type: 'position'; id: string; position?: { x: number; y: number }; dragging?: boolean } =>
+        c.type === 'position'
+    );
+
+    const dragging = posChanges.filter(c => c.dragging && c.position);
+
+    if (dragging.length === 1) {
+      const change = dragging[0];
+      const dragNode = nodes.find(n => n.id === change.id);
+      if (dragNode && change.position) {
+        const dw = dragNode.measured?.width ?? dragNode.width ?? 150;
+        const dh = dragNode.measured?.height ?? dragNode.height ?? 80;
+        const dcx = change.position.x + dw / 2;
+        const dcy = change.position.y + dh / 2;
+
+        const others = nodes.filter(n => n.id !== change.id);
+
+        // --- Center alignment ---
+        let guideX: number | undefined;
+        let guideY: number | undefined;
+        let bestDx = SNAP_THRESHOLD;
+        let bestDy = SNAP_THRESHOLD;
+
+        for (const n of others) {
+          const nw = n.measured?.width ?? n.width ?? 150;
+          const nh = n.measured?.height ?? n.height ?? 80;
+          const ncx = n.position.x + nw / 2;
+          const ncy = n.position.y + nh / 2;
+
+          if (Math.abs(dcx - ncx) < bestDx) {
+            bestDx = Math.abs(dcx - ncx);
+            guideX = ncx;
+          }
+          if (Math.abs(dcy - ncy) < bestDy) {
+            bestDy = Math.abs(dcy - ncy);
+            guideY = ncy;
+          }
+        }
+
+        // --- Equal spacing snap ---
+        type Rect = { id: string; l: number; r: number; t: number; b: number; cx: number; cy: number };
+        const dragRect: Rect = {
+          id: change.id,
+          l: change.position.x, r: change.position.x + dw,
+          t: change.position.y, b: change.position.y + dh,
+          cx: dcx, cy: dcy,
+        };
+        const otherRects: Rect[] = others.map(n => {
+          const w = n.measured?.width ?? n.width ?? 150;
+          const h = n.measured?.height ?? n.height ?? 80;
+          return { id: n.id, l: n.position.x, r: n.position.x + w, t: n.position.y, b: n.position.y + h, cx: n.position.x + w / 2, cy: n.position.y + h / 2 };
+        });
+
+        let spacingH: { x1: number; x2: number; y: number }[] | undefined;
+        let spacingV: { y1: number; y2: number; x: number }[] | undefined;
+        let spacingSnapX: number | undefined;
+        let spacingSnapY: number | undefined;
+
+        // Collect existing gaps between pairs of other nodes (horizontal)
+        const hSorted = [...otherRects].sort((a, b) => a.cx - b.cx);
+        const existingHGaps: { gap: number; r1: Rect; r2: Rect }[] = [];
+        for (let i = 0; i < hSorted.length - 1; i++) {
+          const gap = hSorted[i + 1].l - hSorted[i].r;
+          if (gap > 0) existingHGaps.push({ gap, r1: hSorted[i], r2: hSorted[i + 1] });
+        }
+
+        // Check if dragged node can match an existing horizontal gap
+        let bestSpacingDx = SNAP_THRESHOLD;
+        for (const other of otherRects) {
+          // dragged node is to the right of other
+          const gapRight = dragRect.l - other.r;
+          if (gapRight > -dw && gapRight < 2000) {
+            for (const eg of existingHGaps) {
+              if (eg.r1.id === other.id || eg.r2.id === other.id) {
+                const diff = Math.abs(gapRight - eg.gap);
+                if (diff < bestSpacingDx && guideX === undefined) {
+                  bestSpacingDx = diff;
+                  spacingSnapX = other.r + eg.gap;
+                  const midY = (dragRect.cy + other.cy) / 2;
+                  const pairMidY = (eg.r1.cy + eg.r2.cy) / 2;
+                  spacingH = [
+                    { x1: other.r, x2: other.r + eg.gap, y: midY },
+                    { x1: eg.r1.r, x2: eg.r2.l, y: pairMidY },
+                  ];
+                }
+              }
+            }
+          }
+          // dragged node is to the left of other
+          const gapLeft = other.l - dragRect.r;
+          if (gapLeft > -dw && gapLeft < 2000) {
+            for (const eg of existingHGaps) {
+              if (eg.r1.id === other.id || eg.r2.id === other.id) {
+                const diff = Math.abs(gapLeft - eg.gap);
+                if (diff < bestSpacingDx && guideX === undefined) {
+                  bestSpacingDx = diff;
+                  spacingSnapX = other.l - eg.gap - dw;
+                  const midY = (dragRect.cy + other.cy) / 2;
+                  const pairMidY = (eg.r1.cy + eg.r2.cy) / 2;
+                  spacingH = [
+                    { x1: other.l - eg.gap, x2: other.l, y: midY },
+                    { x1: eg.r1.r, x2: eg.r2.l, y: pairMidY },
+                  ];
+                }
+              }
+            }
+          }
+        }
+
+        // Collect existing gaps between pairs of other nodes (vertical)
+        const vSorted = [...otherRects].sort((a, b) => a.cy - b.cy);
+        const existingVGaps: { gap: number; r1: Rect; r2: Rect }[] = [];
+        for (let i = 0; i < vSorted.length - 1; i++) {
+          const gap = vSorted[i + 1].t - vSorted[i].b;
+          if (gap > 0) existingVGaps.push({ gap, r1: vSorted[i], r2: vSorted[i + 1] });
+        }
+
+        // Check if dragged node can match an existing vertical gap
+        let bestSpacingDy = SNAP_THRESHOLD;
+        for (const other of otherRects) {
+          const gapBelow = dragRect.t - other.b;
+          if (gapBelow > -dh && gapBelow < 2000) {
+            for (const eg of existingVGaps) {
+              if (eg.r1.id === other.id || eg.r2.id === other.id) {
+                const diff = Math.abs(gapBelow - eg.gap);
+                if (diff < bestSpacingDy && guideY === undefined) {
+                  bestSpacingDy = diff;
+                  spacingSnapY = other.b + eg.gap;
+                  const midX = (dragRect.cx + other.cx) / 2;
+                  const pairMidX = (eg.r1.cx + eg.r2.cx) / 2;
+                  spacingV = [
+                    { y1: other.b, y2: other.b + eg.gap, x: midX },
+                    { y1: eg.r1.b, y2: eg.r2.t, x: pairMidX },
+                  ];
+                }
+              }
+            }
+          }
+          const gapAbove = other.t - dragRect.b;
+          if (gapAbove > -dh && gapAbove < 2000) {
+            for (const eg of existingVGaps) {
+              if (eg.r1.id === other.id || eg.r2.id === other.id) {
+                const diff = Math.abs(gapAbove - eg.gap);
+                if (diff < bestSpacingDy && guideY === undefined) {
+                  bestSpacingDy = diff;
+                  spacingSnapY = other.t - eg.gap - dh;
+                  const midX = (dragRect.cx + other.cx) / 2;
+                  const pairMidX = (eg.r1.cx + eg.r2.cx) / 2;
+                  spacingV = [
+                    { y1: other.t - eg.gap, y2: other.t, x: midX },
+                    { y1: eg.r1.b, y2: eg.r2.t, x: pairMidX },
+                  ];
+                }
+              }
+            }
+          }
+        }
+
+        // Apply snaps — center alignment takes priority, spacing fills in the other axis
+        if (guideX !== undefined) change.position.x = guideX - dw / 2;
+        else if (spacingSnapX !== undefined) change.position.x = spacingSnapX;
+
+        if (guideY !== undefined) change.position.y = guideY - dh / 2;
+        else if (spacingSnapY !== undefined) change.position.y = spacingSnapY;
+
+        setAlignGuides({
+          x: guideX, y: guideY,
+          spacingH: spacingSnapX !== undefined && guideX === undefined ? spacingH : undefined,
+          spacingV: spacingSnapY !== undefined && guideY === undefined ? spacingV : undefined,
+        });
+      }
+    } else {
+      const anyDragging = posChanges.some(c => c.dragging);
+      const anyDragEnd = posChanges.some(c => c.dragging === false);
+      if (!anyDragging || anyDragEnd) {
+        setAlignGuides({});
+      }
+    }
+
+    onNodesChange(changes);
+  }, [nodes, onNodesChange]);
 
   const closeConfigPanel = useCallback(() => setSelectedNode(null), []);
 
@@ -1666,7 +1858,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           <ReactFlow
             nodes={nodes}
             edges={edges}
-            onNodesChange={onNodesChange}
+            onNodesChange={handleNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
             onDrop={onDrop}
@@ -1691,6 +1883,22 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           >
             <Controls />
             <Background variant={BackgroundVariant.Dots} gap={20} size={1} color={theme === 'light' ? '#D5CEBC' : '#1A1D24'} />
+            {(alignGuides.x !== undefined || alignGuides.y !== undefined || alignGuides.spacingH || alignGuides.spacingV) && (
+              <ViewportPortal>
+                {alignGuides.x !== undefined && (
+                  <div className="align-guide align-guide-v" style={{ left: alignGuides.x }} />
+                )}
+                {alignGuides.y !== undefined && (
+                  <div className="align-guide align-guide-h" style={{ top: alignGuides.y }} />
+                )}
+                {alignGuides.spacingH?.map((s, i) => (
+                  <div key={`sh${i}`} className="spacing-marker spacing-marker-h" style={{ left: s.x1, top: s.y, width: s.x2 - s.x1 }} />
+                ))}
+                {alignGuides.spacingV?.map((s, i) => (
+                  <div key={`sv${i}`} className="spacing-marker spacing-marker-v" style={{ left: s.x, top: s.y1, height: s.y2 - s.y1 }} />
+                ))}
+              </ViewportPortal>
+            )}
           </ReactFlow>
           {heatmap && heatmapMaxLoss > 0 && <HeatmapScale maxLoss={heatmapMaxLoss} />}
           {isCalculating && <div className="calc-toast"><span className="calc-toast-spinner" />Calculating…</div>}

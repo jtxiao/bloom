@@ -2647,3 +2647,67 @@ button.file-label:hover {
   pointer-events: auto;
   transition-delay: 0.6s;
 }
+
+.align-guide {
+  position: absolute;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+.align-guide-v {
+  top: -10000px;
+  width: 1px;
+  height: 20000px;
+  background: rgba(59, 130, 246, 0.5);
+}
+
+.align-guide-h {
+  left: -10000px;
+  width: 20000px;
+  height: 1px;
+  background: rgba(59, 130, 246, 0.5);
+}
+
+.spacing-marker {
+  position: absolute;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+.spacing-marker-h {
+  height: 0;
+  border-top: 1px dashed rgba(236, 72, 153, 0.7);
+  transform: translateY(-0.5px);
+}
+
+.spacing-marker-h::before,
+.spacing-marker-h::after {
+  content: '';
+  position: absolute;
+  top: -4px;
+  width: 1px;
+  height: 8px;
+  background: rgba(236, 72, 153, 0.7);
+}
+
+.spacing-marker-h::before { left: 0; }
+.spacing-marker-h::after { right: 0; }
+
+.spacing-marker-v {
+  width: 0;
+  border-left: 1px dashed rgba(236, 72, 153, 0.7);
+  transform: translateX(-0.5px);
+}
+
+.spacing-marker-v::before,
+.spacing-marker-v::after {
+  content: '';
+  position: absolute;
+  left: -4px;
+  height: 1px;
+  width: 8px;
+  background: rgba(236, 72, 153, 0.7);
+}
+
+.spacing-marker-v::before { top: 0; }
+.spacing-marker-v::after { bottom: 0; }
