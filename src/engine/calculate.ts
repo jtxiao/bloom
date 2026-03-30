@@ -756,6 +756,7 @@ interface DischargePowerAccum {
   outputPower: number;
   auxPower: number;
   current: number;
+  currentSq: number;
   voltageOut: number;
 }
 
@@ -778,7 +779,7 @@ function accumulateDischargeStep(
   const data = node.data as unknown as PowerNodeData;
   let acc = accum.get(nodeId);
   if (!acc) {
-    acc = { inputPower: 0, outputPower: 0, auxPower: 0, current: 0, voltageOut: 0 };
+    acc = { inputPower: 0, outputPower: 0, auxPower: 0, current: 0, currentSq: 0, voltageOut: 0 };
     accum.set(nodeId, acc);
   }
 
@@ -795,6 +796,7 @@ function accumulateDischargeStep(
     acc.inputPower += power * dtHours;
     acc.outputPower += power * dtHours;
     acc.current += cur * dtHours;
+    acc.currentSq += cur * cur * dtHours;
     acc.voltageOut += loadV * dtHours;
     return;
   }
@@ -809,6 +811,7 @@ function accumulateDischargeStep(
     acc.inputPower += (downstream + loss) * dtHours;
     acc.outputPower += downstream * dtHours;
     acc.current += current * dtHours;
+    acc.currentSq += current * current * dtHours;
 
     let vOut = upstreamV;
     if (sd.seriesMode === 'diode') {
@@ -853,6 +856,7 @@ function accumulateDischargeStep(
     acc.inputPower += (terminalPower + irLoss) * dtHours;
     acc.outputPower += terminalPower * dtHours;
     acc.current += current * dtHours;
+    acc.currentSq += current * current * dtHours;
     acc.voltageOut += sv * dtHours;
     const auxI = getAuxLoadCurrent(sd.auxLoads, sv, nodeAuxOv);
     acc.auxPower += auxI * sv * dtHours;
@@ -868,6 +872,7 @@ function accumulateDischargeStep(
     acc.inputPower += converterInputPower(cd, inputVoltage, totalOut) * dtHours;
     acc.outputPower += totalOut * dtHours;
     acc.current += current * dtHours;
+    acc.currentSq += current * current * dtHours;
     acc.voltageOut += (inputVoltage > 0 ? actualOutV : 0) * dtHours;
     acc.auxPower += auxP * dtHours;
   }
@@ -1031,6 +1036,7 @@ function simulateBatteryDischarge(
       acc.outputPower /= timeHours;
       acc.auxPower /= timeHours;
       acc.current /= timeHours;
+      acc.currentSq /= timeHours;
       acc.voltageOut /= timeHours;
     }
   }
@@ -1129,6 +1135,7 @@ function computeNodeStateResult(
   auxOverrides?: Record<string, Record<string, boolean>>
 ): StateResult {
   let totalCurrent = 0;
+  let totalCurrentSq = 0;
   let totalInputPower = 0;
   let totalOutputPower = 0;
   let totalAuxPower = 0;
@@ -1178,6 +1185,7 @@ function computeNodeStateResult(
     }
 
     totalCurrent += stepCurrent * dt;
+    totalCurrentSq += stepCurrent * stepCurrent * dt;
     totalVoltageOut += stepVoltageOut * dt;
 
     let stepInputPower: number;
@@ -1241,6 +1249,7 @@ function computeNodeStateResult(
 
   const div = totalDuration > 0 ? totalDuration : 1;
   const currentOut = totalCurrent / div;
+  const currentRms = Math.sqrt(totalCurrentSq / div);
   const voltageOut = totalVoltageOut / div;
   const inputPower = totalInputPower / div;
   const outputPower = totalOutputPower / div;
@@ -1249,7 +1258,7 @@ function computeNodeStateResult(
   const clampedLoss = Math.max(0, powerLoss);
   const efficiency = inputPower > 0 ? Math.min(1, outputPower / inputPower) : 1;
 
-  return { inputPower, outputPower, powerLoss: clampedLoss, efficiency, voltageOut, currentOut, auxPower };
+  return { inputPower, outputPower, powerLoss: clampedLoss, efficiency, voltageOut, currentOut, currentRms, auxPower };
 }
 
 export function analyzeTree(
@@ -1567,6 +1576,7 @@ export function analyzeTree(
     let weightedOutputPower = allScenarios['nom']?.outputPowerAvg ?? 0;
     let weightedAuxPower = 0;
     let weightedCurrentOut = 0;
+    let weightedCurrentRmsSq = 0;
     let voltageOut = 0;
 
     for (const state of states) {
@@ -1574,6 +1584,7 @@ export function analyzeTree(
       if (!sr) continue;
       weightedAuxPower += sr.auxPower * state.fractionOfTime;
       weightedCurrentOut += sr.currentOut * state.fractionOfTime;
+      weightedCurrentRmsSq += sr.currentRms * sr.currentRms * state.fractionOfTime;
       voltageOut += sr.voltageOut * state.fractionOfTime;
     }
 
@@ -1583,6 +1594,7 @@ export function analyzeTree(
       weightedOutputPower = dynamicAvg.outputPower;
       weightedAuxPower = dynamicAvg.auxPower;
       weightedCurrentOut = dynamicAvg.current;
+      weightedCurrentRmsSq = dynamicAvg.currentSq;
       voltageOut = dynamicAvg.voltageOut;
     }
 
@@ -1597,6 +1609,7 @@ export function analyzeTree(
       auxPowerAvg: weightedAuxPower,
       powerLossAvg: powerLoss, efficiencyAvg: efficiency,
       voltageOut, currentOut: weightedCurrentOut,
+      currentRms: Math.sqrt(weightedCurrentRmsSq),
       disabled: disabledNodes.has(n.id),
       batteryLifetimeHours,
       scenarios: allScenarios,

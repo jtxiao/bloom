@@ -139,6 +139,7 @@ export interface StateResult {
   efficiency: number;
   voltageOut: number;
   currentOut: number;
+  currentRms: number;
   auxPower: number;
 }
 
@@ -153,6 +154,7 @@ export interface AnalysisResult {
   efficiencyAvg: number;
   voltageOut: number;
   currentOut: number;
+  currentRms: number;
   disabled: boolean;
   batteryLifetimeHours?: number;
   scenarios: Partial<Record<VoltageScenario, ScenarioResult>>;

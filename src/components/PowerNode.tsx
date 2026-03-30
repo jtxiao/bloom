@@ -133,6 +133,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
     : undefined;
   const displayVoltage = stateRes ? stateRes.voltageOut : analysis?.voltageOut ?? 0;
   const displayCurrent = stateRes ? stateRes.currentOut : analysis?.currentOut ?? 0;
+  const displayCurrentRms = stateRes ? stateRes.currentRms : analysis?.currentRms ?? 0;
   const isDisabled = analysis?.disabled === true;
 
   const heatValue = (() => {
@@ -240,10 +241,13 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
           {isEnabled && displayVoltage > 0 && (
             <div className="node-detail-sm">Vout: {displayVoltage.toFixed(2)}V</div>
           )}
-          {isEnabled && displayCurrent > 0 && (() => {
+          {isEnabled && displayCurrentRms > 0 && (
+            <div className="node-detail-sm">Irms: {formatCurrent(displayCurrentRms)}</div>
+          )}
+          {isEnabled && displayCurrentRms > 0 && (() => {
             const vdrop = sd.seriesMode === 'diode'
               ? (sd.forwardVoltage || 0)
-              : displayCurrent * (sd.resistance || 0);
+              : displayCurrentRms * (sd.resistance || 0);
             if (vdrop < 0.0001) return null;
             return <div className="node-detail-sm">Vdrop: {vdrop >= 0.1 ? `${vdrop.toFixed(2)}V` : `${(vdrop * 1000).toFixed(1)}mV`}</div>;
           })()}
@@ -281,6 +285,9 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
             <div className="node-detail">{displayVoltage.toFixed(2)}V</div>
           )}
           <div className="node-detail-sm">{detail}</div>
+          {ld.loadMode === 'resistor' && displayCurrentRms > 0 && (
+            <div className="node-detail-sm">Irms: {formatCurrent(displayCurrentRms)}</div>
+          )}
         </div>
         {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
         {nodeNotes && <NoteTooltip notes={nodeNotes} />}
