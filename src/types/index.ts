@@ -140,6 +140,8 @@ export interface StateResult {
   voltageOut: number;
   currentOut: number;
   currentRms: number;
+  peakCurrent: number;
+  peakInputPower: number;
   auxPower: number;
 }
 
@@ -155,6 +157,8 @@ export interface AnalysisResult {
   voltageOut: number;
   currentOut: number;
   currentRms: number;
+  peakCurrent: number;
+  peakInputPower: number;
   disabled: boolean;
   batteryLifetimeHours?: number;
   scenarios: Partial<Record<VoltageScenario, ScenarioResult>>;

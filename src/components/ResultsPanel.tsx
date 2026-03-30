@@ -62,6 +62,13 @@ const SCENARIO_COLORS: Record<VoltageScenario, string> = {
   max: '#C9504A',
 };
 
+function formatCurrentVal(amps: number): string {
+  if (amps >= 1) return `${amps.toFixed(2)} A`;
+  if (amps >= 0.001) return `${(amps * 1000).toFixed(1)} mA`;
+  if (amps > 0) return `${(amps * 1e6).toFixed(0)} uA`;
+  return '0 A';
+}
+
 function formatTime(hours: number): string {
   if (hours >= 8760) return `${(hours / 8760).toFixed(1)} yr`;
   if (hours >= 24) return `${(hours / 24).toFixed(1)} days`;
@@ -160,6 +167,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
   const totalLoss = totalInputPower - totalLoadPower;
   const systemEfficiency = totalInputPower > 0 ? totalLoadPower / totalInputPower : 0;
 
+
   const pieDataAll: { name: string; value: number; category: 'loss' | 'aux' | 'load' }[] = [];
   results.forEach((r, i) => {
     const intrinsicLoss = parseFloat((getNodePower(r, i, 'powerLoss') * 1000).toFixed(2));
@@ -201,6 +209,15 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
   const rawTimeSeries = (viewingState && activeSts?.statePoints?.[viewingState])
     ? activeSts.statePoints[viewingState]
     : activeSts?.points ?? [];
+
+  let peakInputPower = 0;
+  let peakInputCurrent = 0;
+  for (const pt of rawTimeSeries) {
+    if (pt.inputPower > peakInputPower) peakInputPower = pt.inputPower;
+    if (pt.inputCurrent > peakInputCurrent) peakInputCurrent = pt.inputCurrent;
+  }
+  const showPeaks = rawTimeSeries.length > 1 && (!hasMultiState || viewingState);
+
   const activeTimeSeries = (() => {
     if (rawTimeSeries.length <= 2) return rawTimeSeries;
     const period = rawTimeSeries[rawTimeSeries.length - 1].time - rawTimeSeries[0].time;
@@ -356,6 +373,18 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
           <div className="result-value">{(systemEfficiency * 100).toFixed(1)}%</div>
           <div className="result-label">System Efficiency</div>
         </div>
+        {showPeaks && (
+          <div className="result-card">
+            <div className="result-value">{formatPowerSigFigs(peakInputPower)}</div>
+            <div className="result-label">Peak Power</div>
+          </div>
+        )}
+        {showPeaks && (
+          <div className="result-card">
+            <div className="result-value">{formatCurrentVal(peakInputCurrent)}</div>
+            <div className="result-label">Peak Current</div>
+          </div>
+        )}
         {viewingState === null && results.filter(r => {
           return r.batteryLifetimeHours != null && r.batteryLifetimeHours > 0;
         }).map(r => (

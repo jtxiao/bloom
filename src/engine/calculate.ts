@@ -1140,6 +1140,8 @@ function computeNodeStateResult(
   let totalOutputPower = 0;
   let totalAuxPower = 0;
   let totalVoltageOut = 0;
+  let peakCurrent = 0;
+  let peakInputPower = 0;
   const numSteps = Math.max(1, times.length);
   const totalDuration = times.length > 1 ? times[times.length - 1] - times[0] : 1;
 
@@ -1245,6 +1247,8 @@ function computeNodeStateResult(
     totalInputPower += stepInputPower * dt;
     totalOutputPower += stepOutputPower * dt;
     totalAuxPower += stepAuxPower * dt;
+    if (stepCurrent > peakCurrent) peakCurrent = stepCurrent;
+    if (stepInputPower > peakInputPower) peakInputPower = stepInputPower;
   }
 
   const div = totalDuration > 0 ? totalDuration : 1;
@@ -1258,7 +1262,7 @@ function computeNodeStateResult(
   const clampedLoss = Math.max(0, powerLoss);
   const efficiency = inputPower > 0 ? Math.min(1, outputPower / inputPower) : 1;
 
-  return { inputPower, outputPower, powerLoss: clampedLoss, efficiency, voltageOut, currentOut, currentRms, auxPower };
+  return { inputPower, outputPower, powerLoss: clampedLoss, efficiency, voltageOut, currentOut, currentRms, peakCurrent, peakInputPower, auxPower };
 }
 
 export function analyzeTree(
@@ -1577,6 +1581,8 @@ export function analyzeTree(
     let weightedAuxPower = 0;
     let weightedCurrentOut = 0;
     let weightedCurrentRmsSq = 0;
+    let peakCurrent = 0;
+    let peakInputPower = 0;
     let voltageOut = 0;
 
     for (const state of states) {
@@ -1585,6 +1591,8 @@ export function analyzeTree(
       weightedAuxPower += sr.auxPower * state.fractionOfTime;
       weightedCurrentOut += sr.currentOut * state.fractionOfTime;
       weightedCurrentRmsSq += sr.currentRms * sr.currentRms * state.fractionOfTime;
+      if (sr.peakCurrent > peakCurrent) peakCurrent = sr.peakCurrent;
+      if (sr.peakInputPower > peakInputPower) peakInputPower = sr.peakInputPower;
       voltageOut += sr.voltageOut * state.fractionOfTime;
     }
 
@@ -1610,6 +1618,7 @@ export function analyzeTree(
       powerLossAvg: powerLoss, efficiencyAvg: efficiency,
       voltageOut, currentOut: weightedCurrentOut,
       currentRms: Math.sqrt(weightedCurrentRmsSq),
+      peakCurrent, peakInputPower,
       disabled: disabledNodes.has(n.id),
       batteryLifetimeHours,
       scenarios: allScenarios,
