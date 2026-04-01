@@ -53,6 +53,94 @@ type TimeSeriesChartRow = {
  * wipes narrow current spikes. Keep per-bucket min/max for input current and
  * input power (plus endpoints) so peaks and dips survive.
  */
+/**
+ * Max Y for stepAfter lines in [lo, hi] on X: on each half-open segment [t_i, t_{i+1}) the value is values from row i.
+ */
+function yMaxStepAfterInDomain(rows: { t: number; values: number[] }[], lo: number, hi: number): number {
+  if (rows.length === 0 || hi <= lo) return 0;
+  let maxV = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const segStart = rows[i].t;
+    const segEnd = i + 1 < rows.length ? rows[i + 1].t : Number.POSITIVE_INFINITY;
+    const overlapStart = Math.max(lo, segStart);
+    const overlapEnd = Math.min(hi, segEnd);
+    if (overlapStart < overlapEnd - 1e-15) {
+      for (const v of rows[i].values) {
+        if (v > maxV) maxV = v;
+      }
+    }
+  }
+  return maxV;
+}
+
+/** Avoid 3499999999999-style float junk in domains and ticks */
+function roundDomainTop(top: number): number {
+  if (!Number.isFinite(top) || top <= 0) return 1;
+  if (top >= 1e12) return parseFloat(top.toPrecision(4));
+  if (top >= 1e6) return parseFloat(top.toPrecision(6));
+  if (top >= 100) return Math.ceil(top);
+  return parseFloat(top.toPrecision(5));
+}
+
+function paddedYDomainFromMax(maxY: number, padFrac = 0.05, minTop = 1e-4): [number, number] {
+  if (maxY <= 0) return [0, 1];
+  const pad = Math.max(maxY * padFrac, minTop);
+  return [0, roundDomainTop(maxY + pad)];
+}
+
+/** Nice ticks from 0 to top (inclusive), limits tick count for stable layout */
+function yTicksZeroToTop(top: number, maxTicks = 6): number[] {
+  if (top <= 0) return [0, 1];
+  const rawStep = top / Math.max(2, maxTicks - 1);
+  const exp = Math.floor(Math.log10(Math.max(rawStep, 1e-12)));
+  const pow = 10 ** exp;
+  const frac = rawStep / pow;
+  const niceFrac = frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 5 ? 5 : 10;
+  const step = niceFrac * pow;
+  const ticks: number[] = [0];
+  for (let v = step; v < top - step * 0.001; v += step) {
+    const r = roundDomainTop(v);
+    if (r !== ticks[ticks.length - 1] && r < top) ticks.push(r);
+  }
+  const last = roundDomainTop(top);
+  if (ticks[ticks.length - 1] !== last) ticks.push(last);
+  return ticks;
+}
+
+/** Short axis labels; never emit huge integer strings */
+function formatYAxisTickMw(v: number): string {
+  if (!Number.isFinite(v)) return '';
+  const a = Math.abs(v);
+  if (a === 0) return '0';
+  if (a >= 1e9) return `${parseFloat((v / 1e9).toPrecision(3))}G`;
+  if (a >= 1e6) return `${parseFloat((v / 1e6).toPrecision(3))}M`;
+  if (a >= 1e3) return `${parseFloat((v / 1e3).toPrecision(3))}k`;
+  if (a >= 100) return `${Math.round(v)}`;
+  if (a >= 10) return `${v.toFixed(1)}`;
+  if (a >= 1) return `${v.toFixed(1)}`;
+  return `${v.toFixed(2)}`;
+}
+
+function formatYAxisTickVolts(v: number): string {
+  if (!Number.isFinite(v)) return '';
+  const a = Math.abs(v);
+  if (a >= 100) return `${Math.round(v)}`;
+  if (a >= 10) return `${v.toFixed(1)}`;
+  return `${v.toFixed(2)}`;
+}
+
+function formatYAxisTickMa(v: number): string {
+  if (!Number.isFinite(v)) return '';
+  const a = Math.abs(v);
+  if (a === 0) return '0';
+  if (a >= 1e6) return `${parseFloat((v / 1e6).toPrecision(3))}M`;
+  if (a >= 1e3) return `${parseFloat((v / 1e3).toPrecision(3))}k`;
+  if (a >= 100) return `${Math.round(v)}`;
+  if (a >= 10) return `${v.toFixed(1)}`;
+  if (a >= 1) return `${v.toFixed(1)}`;
+  return `${v.toFixed(2)}`;
+}
+
 function downsampleTimeSeriesKeepingExtrema<T extends TimeSeriesChartRow>(data: T[], maxPoints: number): T[] {
   if (data.length <= maxPoints) return data;
   const n = data.length;
@@ -338,6 +426,29 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
 
   const chartDomain: [number, number] = zoomDomain ?? [0, scaledMax];
 
+  const lineChartBase = chartTimeSeries.map(t => ({
+    timeScaled: t.timeScaled,
+    inputPower: parseFloat((t.inputPower * 1000).toFixed(2)),
+    totalLoad: parseFloat((t.totalLoad * 1000).toFixed(2)),
+    inputCurrent: parseFloat((t.inputCurrent * 1000).toFixed(2)),
+  }));
+
+  const [xDomLo, xDomHi] = chartDomain;
+  const powerYMax = yMaxStepAfterInDomain(
+    lineChartBase.map(r => ({ t: r.timeScaled, values: [r.inputPower, r.totalLoad] })),
+    xDomLo,
+    xDomHi,
+  );
+  const currentYMax = yMaxStepAfterInDomain(
+    lineChartBase.map(r => ({ t: r.timeScaled, values: [r.inputCurrent] })),
+    xDomLo,
+    xDomHi,
+  );
+  const powerYDomain = paddedYDomainFromMax(powerYMax);
+  const currentYDomain = paddedYDomainFromMax(currentYMax);
+  const powerYTicks = yTicksZeroToTop(powerYDomain[1]);
+  const currentYTicks = yTicksZeroToTop(currentYDomain[1]);
+
   const timeTicks = (() => {
     const [lo, hi] = chartDomain;
     const span = hi - lo;
@@ -493,11 +604,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
           </div>
           <ResponsiveContainer width="100%" height={280}>
             <LineChart
-              data={chartTimeSeries.map(t => ({
-                timeScaled: t.timeScaled,
-                inputPower: parseFloat((t.inputPower * 1000).toFixed(2)),
-                totalLoad: parseFloat((t.totalLoad * 1000).toFixed(2)),
-              }))}
+              data={lineChartBase}
               margin={{ top: 10, right: 20, bottom: 40, left: 16 }}
               onMouseDown={onMouseDown}
               onMouseMove={onMouseMove}
@@ -505,7 +612,14 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
             >
               <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
               <XAxis dataKey="timeScaled" type="number" domain={chartDomain} ticks={timeTicks} tick={{ fill: axisColor, fontSize: 11 }} label={{ value: `Time (${timeUnit})`, position: 'bottom', offset: 0, fill: axisColor, fontSize: 11 }} allowDataOverflow />
-              <YAxis tick={{ fill: axisColor, fontSize: 11 }} label={{ value: 'mW', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} />
+              <YAxis
+                domain={powerYDomain}
+                ticks={powerYTicks}
+                tickFormatter={formatYAxisTickMw}
+                tick={{ fill: axisColor, fontSize: 11 }}
+                label={{ value: 'mW', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }}
+                allowDataOverflow
+              />
               <Tooltip
                 contentStyle={tooltipStyle}
                 labelStyle={{ color: tooltipLabelColor }}
@@ -530,10 +644,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
           </div>
           <ResponsiveContainer width="100%" height={220}>
             <LineChart
-              data={chartTimeSeries.map(t => ({
-                timeScaled: t.timeScaled,
-                inputCurrent: parseFloat((t.inputCurrent * 1000).toFixed(2)),
-              }))}
+              data={lineChartBase}
               margin={{ top: 10, right: 20, bottom: 24, left: 16 }}
               onMouseDown={onMouseDown}
               onMouseMove={onMouseMove}
@@ -541,7 +652,14 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
             >
               <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
               <XAxis dataKey="timeScaled" type="number" domain={chartDomain} ticks={timeTicks} tick={{ fill: axisColor, fontSize: 11 }} label={{ value: `Time (${timeUnit})`, position: 'insideBottom', offset: -14, fill: axisColor, fontSize: 11 }} allowDataOverflow />
-              <YAxis tick={{ fill: axisColor, fontSize: 11 }} label={{ value: 'mA', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} />
+              <YAxis
+                domain={currentYDomain}
+                ticks={currentYTicks}
+                tickFormatter={formatYAxisTickMa}
+                tick={{ fill: axisColor, fontSize: 11 }}
+                label={{ value: 'mA', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }}
+                allowDataOverflow
+              />
               <Tooltip
                 contentStyle={tooltipStyle}
                 labelStyle={{ color: tooltipLabelColor }}
@@ -572,7 +690,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
                   <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
                   <XAxis dataKey="timeHours" tick={{ fill: axisColor, fontSize: 11 }}
                     label={{ value: 'Time (hr)', position: 'insideBottom', offset: -14, fill: axisColor, fontSize: 11 }} />
-                  <YAxis tick={{ fill: axisColor, fontSize: 11 }}
+                  <YAxis tick={{ fill: axisColor, fontSize: 11 }} tickFormatter={formatYAxisTickVolts}
                     label={{ value: 'V', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} domain={['auto', 'auto']} />
                   <Tooltip
                     contentStyle={tooltipStyle}
@@ -589,7 +707,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
                   <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
                   <XAxis dataKey="timeHours" tick={{ fill: axisColor, fontSize: 11 }}
                     label={{ value: 'Time (hr)', position: 'insideBottom', offset: -14, fill: axisColor, fontSize: 11 }} />
-                  <YAxis tick={{ fill: axisColor, fontSize: 11 }}
+                  <YAxis tick={{ fill: axisColor, fontSize: 11 }} tickFormatter={formatYAxisTickMa}
                     label={{ value: 'mA', angle: -90, position: 'insideLeft', offset: -4, fill: axisColor, fontSize: 11 }} domain={['auto', 'auto']} />
                   <Tooltip
                     contentStyle={tooltipStyle}
