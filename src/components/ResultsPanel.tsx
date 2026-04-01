@@ -620,13 +620,14 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
           <tbody>
             {results.map((r, i) => {
               const isLoad = r.type === 'load';
+              const isSource = r.type === 'source';
               const inp = getNodePower(r, i, 'inputPower');
               const auxVal = getNodePower(r, i, 'auxPower');
               return (
                 <tr key={r.nodeId}>
                   <td>{r.label}</td>
                   <td><span className={`type-badge ${r.type}`}>{r.type}</span></td>
-                  <td>{formatPowerSigFigs(inp)}</td>
+                  <td>{isLoad || isSource ? '—' : formatPowerSigFigs(inp)}</td>
                   <td>{isLoad ? '—' : formatPowerSigFigs(getNodePower(r, i, 'outputPower'))}</td>
                   <td>{auxVal > 0 ? formatPowerSigFigs(auxVal) : '—'}</td>
                   <td className="loss-cell">{isLoad ? formatPowerSigFigs(inp) : formatPowerSigFigs(getNodePower(r, i, 'powerLoss'))}</td>

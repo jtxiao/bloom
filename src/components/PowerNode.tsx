@@ -30,14 +30,17 @@ function AnalysisBadge({ analysis, activeStateId, activeScenario }: { analysis: 
   const auxP = sr?.auxPower ?? analysis.auxPowerAvg ?? 0;
   const lossP = sr?.powerLoss ?? analysis.powerLossAvg;
   const eff = sr?.efficiency ?? analysis.efficiencyAvg;
+  const isSource = analysis.type === 'source';
+  const primaryLabel = isSource ? 'Out' : 'In';
+  const primaryP = isSource ? outputP : inputP;
 
   return (
     <div className="analysis-badge">
       <div className="analysis-row">
-        <span className="analysis-label">In</span>
-        <span className="analysis-val">{formatPower(inputP)}</span>
+        <span className="analysis-label">{primaryLabel}</span>
+        <span className="analysis-val">{formatPower(primaryP)}</span>
       </div>
-      {analysis.type !== 'load' && outputP > 0.0000001 && (
+      {analysis.type !== 'load' && !isSource && outputP > 0.0000001 && (
         <div className="analysis-row">
           <span className="analysis-label">Out</span>
           <span className="analysis-val">{formatPower(outputP)}</span>
