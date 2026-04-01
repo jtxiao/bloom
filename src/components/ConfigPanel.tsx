@@ -24,6 +24,8 @@ interface ConfigPanelProps {
   onUpdate: (id: string, data: PowerNodeData) => void;
   onClose: () => void;
   onDelete: (id: string) => void;
+  /** True when an upstream converter/series/load is off; blocks turning this node on until the rail is active. */
+  upstreamAncestorsOff?: boolean;
   auxOverrides?: Record<string, boolean>;
   onAuxOverrideToggle?: (nodeId: string, auxId: string, enabled: boolean) => void;
 }
@@ -292,7 +294,7 @@ function OptNumInput({ value, onChange, placeholder = '--' }: OptNumInputProps) 
   );
 }
 
-export default function ConfigPanel({ node, onUpdate, onClose, onDelete, auxOverrides, onAuxOverrideToggle }: ConfigPanelProps) {
+export default function ConfigPanel({ node, onUpdate, onClose, onDelete, upstreamAncestorsOff = false, auxOverrides, onAuxOverrideToggle }: ConfigPanelProps) {
   const incoming = node.data as unknown as PowerNodeData;
   const [localData, setLocalData] = useState<PowerNodeData>(incoming);
   const localRef = useRef(localData);
@@ -346,13 +348,13 @@ export default function ConfigPanel({ node, onUpdate, onClose, onDelete, auxOver
           <SourceConfig data={data} onChange={setLocalDataTracked} />
         )}
         {data.type === 'converter' && (
-          <ConverterConfig data={data as PowerConverterData} onChange={setLocalDataTracked} />
+          <ConverterConfig data={data as PowerConverterData} onChange={setLocalDataTracked} upstreamAncestorsOff={upstreamAncestorsOff} />
         )}
         {data.type === 'series' && (
-          <SeriesConfig data={data as SeriesElementData} onChange={setLocalDataTracked} />
+          <SeriesConfig data={data as SeriesElementData} onChange={setLocalDataTracked} upstreamAncestorsOff={upstreamAncestorsOff} />
         )}
         {data.type === 'load' && (
-          <LoadConfig data={data as LoadData} onChange={setLocalDataTracked} />
+          <LoadConfig data={data as LoadData} onChange={setLocalDataTracked} upstreamAncestorsOff={upstreamAncestorsOff} />
         )}
         {hasAux && (
           <AuxLoadsSection
@@ -719,8 +721,19 @@ function SourceConfig({ data, onChange }: { data: PowerSourceData; onChange: (d:
   );
 }
 
-function SeriesConfig({ data, onChange }: { data: SeriesElementData; onChange: (d: SeriesElementData) => void }) {
+function SeriesConfig({ data, onChange, upstreamAncestorsOff }: { data: SeriesElementData; onChange: (d: SeriesElementData) => void; upstreamAncestorsOff?: boolean }) {
   const enabled = data.enabled !== false;
+  const blockTurnOn = !!upstreamAncestorsOff && !enabled;
+  const enabledToggle = (
+    <button
+      type="button"
+      className={`toggle-btn ${enabled ? 'on' : 'off'}`}
+      disabled={blockTurnOn}
+      onClick={() => onChange({ ...data, enabled: !enabled })}
+    >
+      {enabled ? 'ON' : 'OFF'}
+    </button>
+  );
   return (
     <div className="config-fields">
       <label>
@@ -729,12 +742,11 @@ function SeriesConfig({ data, onChange }: { data: SeriesElementData; onChange: (
       </label>
       <label className="toggle-label">
         Enabled
-        <button
-          className={`toggle-btn ${enabled ? 'on' : 'off'}`}
-          onClick={() => onChange({ ...data, enabled: !enabled })}
-        >
-          {enabled ? 'ON' : 'OFF'}
-        </button>
+        {blockTurnOn ? (
+          <Tooltip text="Enable upstream converters or series elements on the path to the source before turning this on.">
+            <span style={{ display: 'inline-block' }}>{enabledToggle}</span>
+          </Tooltip>
+        ) : enabledToggle}
       </label>
       <label>
         Mode
@@ -759,7 +771,7 @@ function SeriesConfig({ data, onChange }: { data: SeriesElementData; onChange: (
   );
 }
 
-function ConverterConfig({ data, onChange }: { data: PowerConverterData; onChange: (d: PowerConverterData) => void }) {
+function ConverterConfig({ data, onChange, upstreamAncestorsOff }: { data: PowerConverterData; onChange: (d: PowerConverterData) => void; upstreamAncestorsOff?: boolean }) {
   const effMode = data.efficiencyMode ?? (data.efficiencyCurves?.length ? 'curve' : 'flat');
   const curves = data.efficiencyCurves || [];
   const [selectedCurveIdx, setSelectedCurveIdx] = useState(0);
@@ -874,6 +886,17 @@ function ConverterConfig({ data, onChange }: { data: PowerConverterData; onChang
   };
 
   const convEnabled = data.enabled !== false;
+  const blockTurnOn = !!upstreamAncestorsOff && !convEnabled;
+  const convToggle = (
+    <button
+      type="button"
+      className={`toggle-btn ${convEnabled ? 'on' : 'off'}`}
+      disabled={blockTurnOn}
+      onClick={() => onChange({ ...data, enabled: !convEnabled })}
+    >
+      {convEnabled ? 'ON' : 'OFF'}
+    </button>
+  );
   return (
     <div className="config-fields">
       <label>
@@ -882,12 +905,11 @@ function ConverterConfig({ data, onChange }: { data: PowerConverterData; onChang
       </label>
       <label className="toggle-label">
         Enabled
-        <button
-          className={`toggle-btn ${convEnabled ? 'on' : 'off'}`}
-          onClick={() => onChange({ ...data, enabled: !convEnabled })}
-        >
-          {convEnabled ? 'ON' : 'OFF'}
-        </button>
+        {blockTurnOn ? (
+          <Tooltip text="Enable upstream converters or series elements on the path to the source before turning this on.">
+            <span style={{ display: 'inline-block' }}>{convToggle}</span>
+          </Tooltip>
+        ) : convToggle}
       </label>
       <label>
         Type
@@ -1023,7 +1045,7 @@ function ConverterConfig({ data, onChange }: { data: PowerConverterData; onChang
   );
 }
 
-function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData) => void }) {
+function LoadConfig({ data, onChange, upstreamAncestorsOff }: { data: LoadData; onChange: (d: LoadData) => void; upstreamAncestorsOff?: boolean }) {
   const [newTime, setNewTime] = useState('');
   const [newCurrent, setNewCurrent] = useState('');
 
@@ -1091,6 +1113,17 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
 
 
   const loadEnabled = data.enabled !== false;
+  const blockTurnOn = !!upstreamAncestorsOff && !loadEnabled;
+  const loadToggle = (
+    <button
+      type="button"
+      className={`toggle-btn ${loadEnabled ? 'on' : 'off'}`}
+      disabled={blockTurnOn}
+      onClick={() => onChange({ ...data, enabled: !loadEnabled })}
+    >
+      {loadEnabled ? 'ON' : 'OFF'}
+    </button>
+  );
   return (
     <div className="config-fields">
       <label>
@@ -1099,12 +1132,11 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
       </label>
       <label className="toggle-label">
         Enabled
-        <button
-          className={`toggle-btn ${loadEnabled ? 'on' : 'off'}`}
-          onClick={() => onChange({ ...data, enabled: !loadEnabled })}
-        >
-          {loadEnabled ? 'ON' : 'OFF'}
-        </button>
+        {blockTurnOn ? (
+          <Tooltip text="Enable upstream converters or series elements on the path to the source before turning this on.">
+            <span style={{ display: 'inline-block' }}>{loadToggle}</span>
+          </Tooltip>
+        ) : loadToggle}
       </label>
       <label>
         Load Mode

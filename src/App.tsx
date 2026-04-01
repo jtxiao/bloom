@@ -1,4 +1,4 @@
-import { useCallback, useState, useRef, useEffect, DragEvent } from 'react';
+import { useCallback, useState, useRef, useEffect, useMemo, DragEvent } from 'react';
 import {
   ReactFlow,
   Controls,
@@ -48,6 +48,7 @@ import {
   clonePowerStatesForWorker,
 } from './utils/cloneForAnalysisWorker';
 import type { AnalysisWorkerResponse } from './workers/analysisWorker.types';
+import { computeUpstreamAncestorOffMap, hasUpstreamAncestorOff } from './utils/upstreamEnabled';
 
 const nodeTypes = { powerNode: PowerNode, groupNode: GroupNode, textNode: TextNode };
 const edgeTypes = { smart: SmartBezierEdge };
@@ -976,40 +977,34 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       const isSwitch = data.type === 'converter' || data.type === 'series';
       const switchEnabled = isSwitch ? (data as { enabled?: boolean }).enabled !== false : true;
 
+      const activeSt = powerStates.find(s => s.id === activeStateIdRef.current);
+      if (
+        (data.type === 'converter' || data.type === 'series' || data.type === 'load') &&
+        (data as { enabled?: boolean }).enabled !== false &&
+        hasUpstreamAncestorOff(id, nodes as Node[], edges, activeSt)
+      ) {
+        return;
+      }
+
       setNodes(nds => {
         let changed = false;
         const updated = nds.map(n => {
           if (n.id !== id) return n;
           const prev = n.data as Record<string, unknown>;
-          const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, ...prevRest } = prev;
-          const { _analysis: _a2, _activeStateId: _s2, _activeScenario: _sc2, _heatmap: _h2, _maxLoss: _m2, ...newRest } = data as unknown as Record<string, unknown>;
-          void _a2; void _s2; void _sc2; void _h2; void _m2;
+          const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _upstreamAncestorOff: _prevUp, ...prevRest } = prev;
+          const { _analysis: _a2, _activeStateId: _s2, _activeScenario: _sc2, _heatmap: _h2, _maxLoss: _m2, _upstreamAncestorOff: _u2, ...newRest } = data as unknown as Record<string, unknown>;
+          void _a2; void _s2; void _sc2; void _h2; void _m2; void _u2; void _prevUp;
           if (JSON.stringify(prevRest) === JSON.stringify(newRest)) return n;
           changed = true;
           return { ...n, data: { ...data, _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss } };
         });
         if (!changed) return nds;
-        if (isSwitch) {
-          const descendants = new Set<string>();
-          const walk = (nid: string) => {
-            for (const e of edges) {
-              if (e.source === nid && !descendants.has(e.target)) {
-                descendants.add(e.target);
-                walk(e.target);
-              }
-            }
-          };
-          walk(id);
-          if (descendants.size > 0) {
-            return updated.map(n => {
-              if (!descendants.has(n.id)) return n;
-              const a = (n.data as Record<string, unknown>)?._analysis as Record<string, unknown> | undefined;
-              if (!a) return n;
-              return { ...n, data: { ...n.data, _analysis: { ...a, disabled: !switchEnabled } } };
-            });
-          }
-        }
-        return updated;
+        const st = powerStates.find(s => s.id === activeStateIdRef.current);
+        const upMap = computeUpstreamAncestorOffMap(updated, edges, st);
+        return updated.map(n => ({
+          ...n,
+          data: { ...n.data, _upstreamAncestorOff: upMap.get(n.id) ?? false },
+        }));
       });
       setSelectedNode(prev => (prev && prev.id === id ? { ...prev, data } : prev));
       setResults(prev => {
@@ -1033,8 +1028,16 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         ));
       }
     },
-    [setNodes, setPowerStates, edges]
+    [setNodes, setPowerStates, edges, nodes, powerStates]
   );
+
+  const configUpstreamAncestorsOff = useMemo(() => {
+    if (!selectedNode) return false;
+    const d = selectedNode.data as unknown as PowerNodeData;
+    if (d.type !== 'converter' && d.type !== 'series' && d.type !== 'load') return false;
+    const st = powerStates.find(s => s.id === activeStateId);
+    return hasUpstreamAncestorOff(selectedNode.id, nodes, edges, st);
+  }, [selectedNode, nodes, edges, powerStates, activeStateId]);
 
   const onAuxOverrideToggle = useCallback((nodeId: string, auxId: string, enabled: boolean) => {
     setPowerStates(prev => prev.map(s => {
@@ -1100,16 +1103,20 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       const maxLoss = Math.max(...r.map(heatVal), 0);
       setHeatmapMaxLoss(maxLoss);
       setNodes(nds => {
+        const curStateForUp = snapPowerStates.find(s => s.id === snapActiveStateId);
+        const upMap = computeUpstreamAncestorOffMap(nds, snapEdges, curStateForUp);
         let changed = false;
         const updated = nds.map(n => {
           const d = n.data as Record<string, unknown>;
           const res = resultMap.get(n.id);
+          const nextUp = upMap.get(n.id) ?? false;
           if (d._analysis === res && d._activeStateId === snapActiveStateId
-            && d._activeScenario === snapActiveScenario && d._heatmap === snapHeatmap && d._maxLoss === maxLoss) {
+            && d._activeScenario === snapActiveScenario && d._heatmap === snapHeatmap && d._maxLoss === maxLoss
+            && d._upstreamAncestorOff === nextUp) {
             return n;
           }
           changed = true;
-          return { ...n, data: { ...d, _analysis: res, _activeStateId: snapActiveStateId, _activeScenario: snapActiveScenario, _heatmap: snapHeatmap, _maxLoss: maxLoss } };
+          return { ...n, data: { ...d, _analysis: res, _activeStateId: snapActiveStateId, _activeScenario: snapActiveScenario, _heatmap: snapHeatmap, _maxLoss: maxLoss, _upstreamAncestorOff: nextUp } };
         });
         return changed ? updated : nds;
       });
@@ -1333,6 +1340,42 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       + '||' + _statesFpCache.fp + '||v' + ANALYSIS_VERSION;
   })();
 
+  const upstreamSyncFp = useMemo(() => {
+    const st = powerStates.find(s => s.id === activeStateId);
+    const sorted = [...nodes]
+      .filter(n => n.type !== 'groupNode' && n.type !== 'textNode')
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const parts: string[] = [];
+    for (const n of sorted) {
+      const d = n.data as Record<string, unknown>;
+      const t = d.type as string;
+      if (t === 'converter' || t === 'series' || t === 'load') {
+        const hasOv = !!(st?.enabledOverrides && n.id in st.enabledOverrides);
+        const eff = hasOv ? st!.enabledOverrides![n.id] : (d as { enabled?: boolean }).enabled !== false;
+        parts.push(`${n.id}:${eff ? 1 : 0}`);
+      }
+    }
+    const edgeStr = [...edges].map(e => `${e.source}->${e.target}`).sort().join('|');
+    return `${activeStateId}|${edgeStr}|${parts.join(',')}`;
+  }, [nodes, edges, powerStates, activeStateId]);
+
+  useEffect(() => {
+    const st = powerStates.find(s => s.id === activeStateId);
+    setNodes(nds => {
+      const upMap = computeUpstreamAncestorOffMap(nds, edges, st);
+      let changed = false;
+      const updated = nds.map(n => {
+        const next = upMap.get(n.id) ?? false;
+        const d = n.data as Record<string, unknown>;
+        if (d._upstreamAncestorOff === next) return n;
+        changed = true;
+        return { ...n, data: { ...n.data, _upstreamAncestorOff: next } };
+      });
+      return changed ? updated : nds;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- edges/activeState encoded in upstreamSyncFp
+  }, [upstreamSyncFp, setNodes]);
+
   useEffect(() => {
     const skip = skipAnalysisRef.current;
     if (skip) skipAnalysisRef.current = false;
@@ -1374,16 +1417,20 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     const heatVal = (res: AnalysisResult) => res.type === 'load' ? res.inputPowerAvg : (res.powerLossAvg + (res.auxPowerAvg ?? 0));
     const maxLoss = Math.max(...results.map(heatVal), 0);
     setNodes(nds => {
+      const activeStateForUp = powerStates.find(s => s.id === activeStateId);
+      const upMap = computeUpstreamAncestorOffMap(nds, edges, activeStateForUp);
       let changed = false;
       const updated = nds.map(n => {
         const d = n.data as Record<string, unknown>;
         const res = resultMap.get(n.id);
+        const nextUp = upMap.get(n.id) ?? false;
         if (d._analysis === res && d._activeStateId === activeStateId
-          && d._activeScenario === activeScenario && d._heatmap === heatmap && d._maxLoss === maxLoss) {
+          && d._activeScenario === activeScenario && d._heatmap === heatmap && d._maxLoss === maxLoss
+          && d._upstreamAncestorOff === nextUp) {
           return n;
         }
         changed = true;
-        return { ...n, data: { ...n.data, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
+        return { ...n, data: { ...n.data, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss, _upstreamAncestorOff: nextUp } };
       });
       return changed ? updated : nds;
     });
@@ -2180,6 +2227,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           onUpdate={updateNodeData}
           onClose={closeConfigPanel}
           onDelete={deleteNode}
+          upstreamAncestorsOff={configUpstreamAncestorsOff}
           auxOverrides={powerStates.find(s => s.id === activeStateId)?.auxLoadOverrides?.[selectedNode.id]}
           onAuxOverrideToggle={onAuxOverrideToggle}
         />

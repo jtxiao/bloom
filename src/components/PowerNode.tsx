@@ -123,7 +123,7 @@ function NoteTooltip({ notes }: { notes: string[] }) {
 }
 
 function PowerNode({ data }: { data: Record<string, unknown> }) {
-  const d = data as unknown as PowerNodeData & { _analysis?: AnalysisResult; _activeStateId?: string; _activeScenario?: VoltageScenario; _heatmap?: boolean; _maxLoss?: number; _notes?: string[] };
+  const d = data as unknown as PowerNodeData & { _analysis?: AnalysisResult; _activeStateId?: string; _activeScenario?: VoltageScenario; _heatmap?: boolean; _maxLoss?: number; _notes?: string[]; _upstreamAncestorOff?: boolean };
   const analysis = d._analysis;
   const nodeNotes = d._notes;
   const activeStateId = d._activeStateId;
@@ -194,14 +194,16 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
 
   if (d.type === 'converter') {
     const cd = d as PowerConverterData;
-    const isEnabled = cd.enabled !== false;
+    const userOn = cd.enabled !== false;
+    const upstreamOff = d._upstreamAncestorOff === true;
+    const railActive = userOn && !upstreamOff;
     const iq = cd.quiescentCurrent || 0;
     const curveCount = cd.efficiencyCurves?.length ?? 0;
     return (
-      <div className={`power-node converter-node ${isDisabled || !isEnabled ? 'node-disabled' : ''}`} style={heatStyle}>
+      <div className={`power-node converter-node ${isDisabled || !railActive ? 'node-disabled' : ''}`} style={heatStyle}>
         <div className={`node-header converter ${cd.converterType}`}>
           {cd.converterType.toUpperCase()}
-          {!isEnabled && <span className="node-off-badge">OFF</span>}
+          {!userOn && <span className="node-off-badge">OFF</span>}
         </div>
         <div className="node-body">
           <div className="node-label">{cd.label}</div>
@@ -214,7 +216,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
             {iq > 0 && ` / Iq: ${(iq * 1e6).toFixed(0)}uA`}
           </div>
         </div>
-        {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {!isDisabled && railActive && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
         {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
@@ -224,7 +226,9 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
 
   if (d.type === 'series') {
     const sd = d as SeriesElementData;
-    const isEnabled = sd.enabled !== false;
+    const userOn = sd.enabled !== false;
+    const upstreamOff = d._upstreamAncestorOff === true;
+    const railActive = userOn && !upstreamOff;
     let detail: string;
     if (sd.seriesMode === 'diode') {
       detail = `Vf: ${((sd.forwardVoltage || 0) * 1000).toFixed(0)} mV`;
@@ -233,21 +237,21 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
       detail = r >= 1 ? `${r.toFixed(2)} ohm` : `${(r * 1000).toFixed(1)} mohm`;
     }
     return (
-      <div className={`power-node series-node ${!isEnabled ? 'node-disabled' : ''}`} style={heatStyle}>
+      <div className={`power-node series-node ${isDisabled || !railActive ? 'node-disabled' : ''}`} style={heatStyle}>
         <div className="node-header series">
           {sd.seriesMode === 'diode' ? 'DIODE' : 'SERIES'}
-          {!isEnabled && <span className="node-off-badge">OFF</span>}
+          {!userOn && <span className="node-off-badge">OFF</span>}
         </div>
         <div className="node-body">
           <div className="node-label">{sd.label}</div>
           <div className="node-detail">{detail}</div>
-          {isEnabled && displayVoltage > 0 && (
+          {railActive && displayVoltage > 0 && (
             <div className="node-detail-sm">Vout: {displayVoltage.toFixed(2)}V</div>
           )}
-          {isEnabled && displayCurrentRms > 0 && (
+          {railActive && displayCurrentRms > 0 && (
             <div className="node-detail-sm">Irms: {formatCurrent(displayCurrentRms)}</div>
           )}
-          {isEnabled && displayCurrentRms > 0 && (() => {
+          {railActive && displayCurrentRms > 0 && (() => {
             const vdrop = sd.seriesMode === 'diode'
               ? (sd.forwardVoltage || 0)
               : displayCurrentRms * (sd.resistance || 0);
@@ -255,7 +259,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
             return <div className="node-detail-sm">Vdrop: {vdrop >= 0.1 ? `${vdrop.toFixed(2)}V` : `${(vdrop * 1000).toFixed(1)}mV`}</div>;
           })()}
         </div>
-        {isEnabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {!isDisabled && railActive && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
         {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
         <Handle type="source" position={Position.Right} id="source" />
@@ -265,7 +269,9 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
 
   if (d.type === 'load') {
     const ld = d as LoadData;
-    const isEnabled = ld.enabled !== false;
+    const userOn = ld.enabled !== false;
+    const upstreamOff = d._upstreamAncestorOff === true;
+    const railActive = userOn && !upstreamOff;
     let detail: string;
     if (ld.loadMode === 'resistor') {
       detail = ld.resistance >= 1000
@@ -277,14 +283,14 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
       detail = displayCurrent > 0 ? `Avg: ${formatCurrent(displayCurrent)}` : '--';
     }
     return (
-      <div className={`power-node load-node ${isDisabled || !isEnabled ? 'node-disabled' : ''}`} style={heatStyle}>
+      <div className={`power-node load-node ${isDisabled || !railActive ? 'node-disabled' : ''}`} style={heatStyle}>
         <div className="node-header load">
           {ld.loadMode === 'resistor' ? 'RESISTOR' : 'LOAD'}
-          {!isEnabled && <span className="node-off-badge">OFF</span>}
+          {!userOn && <span className="node-off-badge">OFF</span>}
         </div>
         <div className="node-body">
           <div className="node-label">{ld.label}</div>
-          {!isDisabled && displayVoltage > 0 && (
+          {!isDisabled && railActive && displayVoltage > 0 && (
             <div className="node-detail">{displayVoltage.toFixed(2)}V</div>
           )}
           <div className="node-detail-sm">{detail}</div>
@@ -292,7 +298,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
             <div className="node-detail-sm">Irms: {formatCurrent(displayCurrentRms)}</div>
           )}
         </div>
-        {!isDisabled && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
+        {!isDisabled && railActive && analysis && <AnalysisBadge analysis={analysis} activeStateId={activeStateId} activeScenario={activeScenario} />}
         {nodeNotes && <NoteTooltip notes={nodeNotes} />}
         <Handle type="target" position={Position.Left} id="target" />
       </div>
@@ -302,7 +308,7 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
   return null;
 }
 
-const META_KEYS = new Set(['_analysis', '_activeStateId', '_activeScenario', '_heatmap', '_maxLoss', '_notes']);
+const META_KEYS = new Set(['_analysis', '_activeStateId', '_activeScenario', '_heatmap', '_maxLoss', '_notes', '_upstreamAncestorOff']);
 
 function shallowEqualExceptMeta(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   const keysA = Object.keys(a).filter(k => !META_KEYS.has(k));
@@ -327,6 +333,7 @@ function powerNodePropsEqual(
   if (pa._heatmap !== na._heatmap) return false;
   if (pa._maxLoss !== na._maxLoss) return false;
   if (pa._notes !== na._notes) return false;
+  if (pa._upstreamAncestorOff !== na._upstreamAncestorOff) return false;
   return shallowEqualExceptMeta(pa, na);
 }
 
