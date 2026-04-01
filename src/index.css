@@ -1227,6 +1227,10 @@ button.file-label:hover {
   white-space: nowrap;
 }
 
+.results-table .loss-cell {
+  color: #C9504A;
+}
+
 .results-table td:first-child {
   max-width: 140px;
   overflow: hidden;

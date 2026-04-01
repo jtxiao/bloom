@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react';
 import type { Node } from '@xyflow/react';
 import Papa from 'papaparse';
+import CsvImportWorker from '../workers/csvImportWorker?worker';
 import Tooltip from './Tooltip';
 import type {
   PowerNodeData,
@@ -49,6 +50,75 @@ function parseSI(raw: string): { value: number; hasSuffix: boolean } {
   return suffix
     ? { value: num * (SI_SUFFIXES[suffix] ?? 1), hasSuffix: true }
     : { value: num, hasSuffix: false };
+}
+
+/**
+ * Compress a sorted load profile by merging consecutive samples that sit on the
+ * same “plateau” vs the running group average: same sign (when both are
+ * meaningful) and |values| within one order of magnitude. That collapses small
+ * % wiggle on mA–A plateaus without using a fixed 20% band.
+ * Strict local maxima (higher than both neighbors) are never averaged away.
+ */
+const COMPRESS_MAG_EPS = 1e-15;
+const COMPRESS_DECADE = 10;
+const COMPRESS_MAX_POINTS = 2000;
+
+function isStrictLocalMaxRow(sorted: LoadProfilePoint[], i: number): boolean {
+  const m = sorted.length;
+  if (m < 2) return false;
+  const c = sorted[i].current;
+  const L = i > 0 ? sorted[i - 1].current : null;
+  const R = i + 1 < m ? sorted[i + 1].current : null;
+  if (L !== null && c <= L) return false;
+  if (R !== null && c <= R) return false;
+  return L !== null || R !== null;
+}
+
+function currentWithinOrderOfMagnitudeOfAverage(groupAvg: number, c: number): boolean {
+  const ag = Math.abs(groupAvg);
+  const ac = Math.abs(c);
+  if (ag < COMPRESS_MAG_EPS && ac < COMPRESS_MAG_EPS) return true;
+  if (groupAvg * c < 0 && ag >= COMPRESS_MAG_EPS && ac >= COMPRESS_MAG_EPS) return false;
+  const lo = Math.min(ag, ac);
+  const hi = Math.max(ag, ac);
+  if (lo < COMPRESS_MAG_EPS) return hi < COMPRESS_DECADE * COMPRESS_MAG_EPS;
+  return hi <= lo * COMPRESS_DECADE;
+}
+
+function compressLoadProfile(sorted: LoadProfilePoint[]): LoadProfilePoint[] {
+  if (sorted.length <= COMPRESS_MAX_POINTS) return sorted;
+
+  const out: LoadProfilePoint[] = [];
+  const m = sorted.length;
+  const lastT = sorted[m - 1].time;
+  let i = 0;
+
+  while (i < m) {
+    if (isStrictLocalMaxRow(sorted, i)) {
+      out.push({ time: sorted[i].time, current: sorted[i].current });
+      i++;
+      continue;
+    }
+    const segStart = i;
+    let groupSum = sorted[i].current;
+    let groupCount = 1;
+    i++;
+    while (i < m) {
+      if (isStrictLocalMaxRow(sorted, i)) break;
+      const groupAvg = groupSum / groupCount;
+      if (!currentWithinOrderOfMagnitudeOfAverage(groupAvg, sorted[i].current)) break;
+      groupSum += sorted[i].current;
+      groupCount++;
+      i++;
+    }
+    out.push({ time: sorted[segStart].time, current: groupSum / groupCount });
+  }
+
+  if (out[out.length - 1].time !== lastT) {
+    out.push({ time: lastT, current: out[out.length - 1].current });
+  }
+
+  return out;
 }
 
 function allowSIInput(raw: string): boolean {
@@ -108,14 +178,27 @@ function NumInput({ value, onChange, placeholder, scale = 1 }: NumInputProps) {
   );
 }
 
-function InlineNum({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
+function formatSI(value: number, unit: string): string {
+  const abs = Math.abs(value);
+  if (abs === 0) return `0 ${unit}`;
+  if (abs >= 1e6) return `${parseFloat((value / 1e6).toPrecision(4))} M${unit}`;
+  if (abs >= 1e3) return `${parseFloat((value / 1e3).toPrecision(4))} k${unit}`;
+  if (abs >= 1) return `${parseFloat(value.toPrecision(4))} ${unit}`;
+  if (abs >= 1e-3) return `${parseFloat((value * 1e3).toPrecision(4))} m${unit}`;
+  if (abs >= 1e-6) return `${parseFloat((value * 1e6).toPrecision(4))} µ${unit}`;
+  if (abs >= 1e-9) return `${parseFloat((value * 1e9).toPrecision(4))} n${unit}`;
+  return `${parseFloat((value * 1e12).toPrecision(4))} p${unit}`;
+}
+
+function InlineNum({ value, onCommit, unit }: { value: number; onCommit: (v: number) => void; unit?: string }) {
   const [editing, setEditing] = useState(false);
   const [local, setLocal] = useState(String(value));
 
   if (!editing) {
+    const display = unit ? formatSI(value, unit) : parseFloat(value.toPrecision(6));
     return (
       <span className="inline-num" onClick={() => { setLocal(String(parseFloat(value.toPrecision(6)))); setEditing(true); }}>
-        {parseFloat(value.toPrecision(6))}
+        {display}
       </span>
     );
   }
@@ -948,7 +1031,7 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
     const { value: time } = parseSI(newTime);
     const { value: currentVal, hasSuffix: currentHasSuffix } = parseSI(newCurrent);
     if (isNaN(time) || isNaN(currentVal)) return;
-    const currentA = currentHasSuffix ? currentVal : currentVal / 1000;
+    const currentA = currentVal;
     onChange({ ...data, loadProfile: [...data.loadProfile, { time, current: currentA }].sort((a, b) => a.time - b.time) });
     setNewTime('');
     setNewCurrent('');
@@ -966,23 +1049,46 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
     onChange({ ...data, loadProfile: updated });
   };
 
+  const [csvProgress, setCsvProgress] = useState<string | null>(null);
   const handleLoadCsv = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    Papa.parse(file, {
-      header: true,
-      dynamicTyping: true,
-      complete: (results) => {
-        const points: LoadProfilePoint[] = [];
-        for (const row of results.data as Record<string, number>[]) {
-          const time = row['time'] ?? row['Time (s)'] ?? row['t'];
-          const current = row['current'] ?? row['Current (A)'] ?? row['i'];
-          if (typeof time === 'number' && typeof current === 'number') points.push({ time, current });
-        }
-        if (points.length > 0) onChange({ ...data, loadProfile: points.sort((a, b) => a.time - b.time) });
-      },
-    });
+    setCsvProgress('Starting…');
+
+    const worker = new CsvImportWorker();
+    worker.onmessage = (ev: MessageEvent) => {
+      const msg = ev.data;
+      if (msg.progress) {
+        const est = msg.estRows != null ? ` / ~${Number(msg.estRows).toLocaleString()}` : '';
+        setCsvProgress(`Importing… ${msg.rows.toLocaleString()}${est} rows (${msg.pct}% of file)`);
+        return;
+      }
+      worker.terminate();
+      if (msg.error) { setCsvProgress(null); return; }
+      if (!msg.points?.length) { setCsvProgress(null); return; }
+      const { points, rowCount, importStats } = msg as {
+        points: unknown[];
+        rowCount: number;
+        importStats?: Record<string, unknown>;
+      };
+      console.log(
+        `Load profile: ${Number(rowCount).toLocaleString()} CSV rows → ${points.length} points (bucketed segments, ≤2000)`,
+      );
+      if (importStats) {
+        console.log('[CSV import] transient / bucket stats', importStats);
+      }
+      setCsvProgress(null);
+      // Defer applying data so the browser can paint after worker + structured clone
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          onChange({ ...data, loadProfile: points });
+        });
+      });
+    };
+    worker.onerror = () => { worker.terminate(); setCsvProgress(null); };
+    worker.postMessage(file);
   };
+
 
   const loadEnabled = data.enabled !== false;
   return (
@@ -1017,36 +1123,37 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
         </label>
       ) : data.loadMode === 'fixed_current' || (!data.loadMode) ? (
         <label>
-          Current (mA)
-          <NumInput value={data.fixedCurrent || 0} scale={1000} onChange={v => onChange({ ...data, fixedCurrent: v })} />
+          Current (A)
+          <NumInput value={data.fixedCurrent || 0} onChange={v => onChange({ ...data, fixedCurrent: v })} />
         </label>
       ) : (() => {
-        const sorted = [...data.loadProfile].sort((a, b) => a.time - b.time);
-        const period = sorted.length > 0 ? sorted[sorted.length - 1].time : 0;
+        const sortedIdx = data.loadProfile
+          .map((p, origIdx) => ({ p, origIdx }))
+          .sort((a, b) => a.p.time - b.p.time);
+        const period = sortedIdx.length > 0 ? sortedIdx[sortedIdx.length - 1].p.time : 0;
         return (
         <div className="eff-section">
           <h4>Load Profile (Current vs Time)</h4>
           <span className="upload-hint">Each row sets the current from its start time until the next row. The profile repeats periodically.</span>
           <div className="eff-upload">
             <label className="file-label">
-              Upload CSV
-              <input type="file" accept=".csv" onChange={handleLoadCsv} />
+              {csvProgress ? csvProgress : 'Upload CSV'}
+              <input type="file" accept=".csv" onChange={handleLoadCsv} disabled={!!csvProgress} />
             </label>
-            <span className="upload-hint">Columns: time, current</span>
+            <span className="upload-hint">CSV with time &amp; current columns (instrument exports supported). Three-pass import: adaptive |ΔI| buckets and merge-protected steps (up to ~2000 points). Manual table compression merges plateaus when |I| stays within one decade of the running average (same sign when both are non-zero).</span>
           </div>
           <div className="eff-table">
             <div className="eff-row header" style={{ gridTemplateColumns: '1fr 1fr 1fr 28px' }}>
-              <span>Start (s)</span><span>Dur</span><span>Current (mA)</span><span></span>
+              <span>Start (s)</span><span>Dur</span><span>Current (A)</span><span></span>
             </div>
-            {sorted.map((p, i) => {
-              const origIdx = data.loadProfile.indexOf(p);
-              const nextTime = i < sorted.length - 1 ? sorted[i + 1].time : period;
+            {sortedIdx.map(({ p, origIdx }, i) => {
+              const nextTime = i < sortedIdx.length - 1 ? sortedIdx[i + 1].p.time : period;
               const dur = nextTime - p.time;
               return (
-              <div key={i} className="eff-row" style={{ gridTemplateColumns: '1fr 1fr 1fr 28px' }}>
+              <div key={origIdx} className="eff-row" style={{ gridTemplateColumns: '1fr 1fr 1fr 28px' }}>
                 <InlineNum value={p.time} onCommit={v => updatePoint(origIdx, 'time', v)} />
                 <span className="dur-cell">{dur > 0 ? `${dur >= 1 ? dur.toFixed(2) + 's' : (dur * 1000).toFixed(0) + 'ms'}` : '--'}</span>
-                <InlineNum value={p.current * 1000} onCommit={v => updatePoint(origIdx, 'current', v / 1000)} />
+                <InlineNum value={p.current} onCommit={v => updatePoint(origIdx, 'current', v)} unit="A" />
                 <button className="remove-btn" onClick={() => removePoint(origIdx)}>X</button>
               </div>
               );
@@ -1059,7 +1166,7 @@ function LoadConfig({ data, onChange }: { data: LoadData; onChange: (d: LoadData
           )}
           <div className="eff-add">
             <input placeholder="Start (s)" type="text" inputMode="decimal" value={newTime} onChange={e => { if (allowSIInput(e.target.value)) setNewTime(e.target.value); }} onKeyDown={e => e.key === 'Enter' && addPoint()} />
-            <input placeholder="Current (mA)" type="text" inputMode="decimal" value={newCurrent} onChange={e => { if (allowSIInput(e.target.value)) setNewCurrent(e.target.value); }} onKeyDown={e => e.key === 'Enter' && addPoint()} />
+            <input placeholder="Current (A)" type="text" inputMode="decimal" value={newCurrent} onChange={e => { if (allowSIInput(e.target.value)) setNewCurrent(e.target.value); }} onKeyDown={e => e.key === 'Enter' && addPoint()} />
             <button onClick={addPoint}>Add</button>
           </div>
         </div>

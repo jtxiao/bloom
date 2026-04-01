@@ -23,27 +23,38 @@ import type {
   Diagnostic,
 } from '../types';
 
+const _sortedEffCache = new WeakMap<EfficiencyPoint[], EfficiencyPoint[]>();
 function interpolateEfficiency(curve: EfficiencyPoint[], loadCurrent: number): number {
   if (curve.length === 0) return 1;
   if (curve.length === 1) return curve[0].efficiency;
-  const sorted = [...curve].sort((a, b) => a.loadCurrent - b.loadCurrent);
+  let sorted = _sortedEffCache.get(curve);
+  if (!sorted) {
+    sorted = [...curve].sort((a, b) => a.loadCurrent - b.loadCurrent);
+    _sortedEffCache.set(curve, sorted);
+  }
   if (loadCurrent <= sorted[0].loadCurrent) return sorted[0].efficiency;
   if (loadCurrent >= sorted[sorted.length - 1].loadCurrent) return sorted[sorted.length - 1].efficiency;
-  for (let i = 0; i < sorted.length - 1; i++) {
-    if (loadCurrent >= sorted[i].loadCurrent && loadCurrent <= sorted[i + 1].loadCurrent) {
-      const denom = sorted[i + 1].loadCurrent - sorted[i].loadCurrent;
-      if (denom === 0) return sorted[i].efficiency;
-      const t = (loadCurrent - sorted[i].loadCurrent) / denom;
-      return sorted[i].efficiency + t * (sorted[i + 1].efficiency - sorted[i].efficiency);
-    }
+  let lo = 0, hi = sorted.length - 2;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid + 1].loadCurrent < loadCurrent) lo = mid + 1;
+    else hi = mid;
   }
-  return sorted[sorted.length - 1].efficiency;
+  const denom = sorted[lo + 1].loadCurrent - sorted[lo].loadCurrent;
+  if (denom === 0) return sorted[lo].efficiency;
+  const t = (loadCurrent - sorted[lo].loadCurrent) / denom;
+  return sorted[lo].efficiency + t * (sorted[lo + 1].efficiency - sorted[lo].efficiency);
 }
 
+const _sortedVinCache = new WeakMap<EfficiencyCurveSet[], EfficiencyCurveSet[]>();
 function getEfficiencyForVin(curves: EfficiencyCurveSet[], inputVoltage: number, loadCurrent: number): number {
   if (curves.length === 0) return 1;
   if (curves.length === 1) return interpolateEfficiency(curves[0].points, loadCurrent);
-  const sorted = [...curves].sort((a, b) => a.inputVoltage - b.inputVoltage);
+  let sorted = _sortedVinCache.get(curves);
+  if (!sorted) {
+    sorted = [...curves].sort((a, b) => a.inputVoltage - b.inputVoltage);
+    _sortedVinCache.set(curves, sorted);
+  }
   if (inputVoltage <= sorted[0].inputVoltage) return interpolateEfficiency(sorted[0].points, loadCurrent);
   if (inputVoltage >= sorted[sorted.length - 1].inputVoltage) return interpolateEfficiency(sorted[sorted.length - 1].points, loadCurrent);
   for (let i = 0; i < sorted.length - 1; i++) {
@@ -91,13 +102,30 @@ function converterInputPower(cd: PowerConverterData, inputVoltage: number, total
   return converterInputCurrent(cd, inputVoltage, totalOutputPower) * inputVoltage;
 }
 
+let _childrenCache: WeakRef<Edge[]> | null = null;
+let _childrenMap: Map<string, string[]> | null = null;
+let _parentMap: Map<string, string> | null = null;
+function _buildEdgeMaps(edges: Edge[]) {
+  if (_childrenCache?.deref() === edges && _childrenMap && _parentMap) return;
+  _childrenMap = new Map();
+  _parentMap = new Map();
+  for (const e of edges) {
+    let c = _childrenMap.get(e.source);
+    if (!c) { c = []; _childrenMap.set(e.source, c); }
+    c.push(e.target);
+    if (!_parentMap.has(e.target)) _parentMap.set(e.target, e.source);
+  }
+  _childrenCache = new WeakRef(edges);
+}
+
 function getChildren(nodeId: string, edges: Edge[]): string[] {
-  return edges.filter(e => e.source === nodeId).map(e => e.target);
+  _buildEdgeMaps(edges);
+  return _childrenMap!.get(nodeId) || [];
 }
 
 function getParent(nodeId: string, edges: Edge[]): string | null {
-  const edge = edges.find(e => e.target === nodeId);
-  return edge ? edge.source : null;
+  _buildEdgeMaps(edges);
+  return _parentMap!.get(nodeId) ?? null;
 }
 
 function resolveInputVoltage(
@@ -415,16 +443,139 @@ function getSeriesChainPower(
   return total;
 }
 
+const _sortedProfileCache = new WeakMap<LoadProfilePoint[], LoadProfilePoint[]>();
+function getSortedProfile(profile: LoadProfilePoint[]): LoadProfilePoint[] {
+  let sorted = _sortedProfileCache.get(profile);
+  if (!sorted) {
+    sorted = [...profile].sort((a, b) => a.time - b.time);
+    _sortedProfileCache.set(profile, sorted);
+  }
+  return sorted;
+}
+
 function getCurrentAtTime(profile: LoadProfilePoint[], time: number): number {
   if (profile.length === 0) return 0;
   if (profile.length === 1) return profile[0].current;
-  const sorted = [...profile].sort((a, b) => a.time - b.time);
+  const sorted = getSortedProfile(profile);
   const period = sorted[sorted.length - 1].time;
   const t = period > 0 ? time % period : time;
-  for (let i = sorted.length - 1; i >= 0; i--) {
-    if (sorted[i].time <= t) return sorted[i].current;
+  let lo = 0, hi = sorted.length - 1;
+  if (sorted[0].time > t) return sorted[sorted.length - 1].current;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (sorted[mid].time <= t) lo = mid;
+    else hi = mid - 1;
   }
-  return sorted[sorted.length - 1].current;
+  return sorted[lo].current;
+}
+
+/** Largest index with times[i] <= t (for mapping profile time to unified timeline voltage). */
+function timeIndexAtOrBefore(times: number[], t: number): number {
+  if (times.length === 0) return 0;
+  if (t < times[0]) return 0;
+  let lo = 0, hi = times.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (times[mid] <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+/**
+ * Left-hold segments over one period P = lastKnot.time, matching getCurrentAtTime:
+ * optional wrap [0, t0) uses last knot current; then [t_i, t_{i+1}) uses I at t_i.
+ */
+function leftHoldProfileSegments(
+  sorted: LoadProfilePoint[]
+): { period: number; segments: { t0: number; tEnd: number; I: number }[] } | null {
+  if (sorted.length < 2) return null;
+  const P = sorted[sorted.length - 1].time;
+  if (!(P > 0)) return null;
+  const segments: { t0: number; tEnd: number; I: number }[] = [];
+  const tFirst = sorted[0].time;
+  if (tFirst > 0) {
+    segments.push({ t0: 0, tEnd: tFirst, I: sorted[sorted.length - 1].current });
+  }
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const ta = sorted[i].time;
+    const tb = sorted[i + 1].time;
+    if (tb > ta) segments.push({ t0: ta, tEnd: tb, I: sorted[i].current });
+  }
+  return { period: P, segments };
+}
+
+/**
+ * Time-weighted averages for a current_profile load from raw keyframes so results stay
+ * correct when the unified timeline is subsampled (sparse steps distort ∫I dt).
+ */
+function stateResultFromCurrentProfile(
+  nodeId: string,
+  ld: LoadData,
+  stateNodeMap: Map<string, Node>,
+  edges: Edge[],
+  times: number[],
+  sourceVoltages: Map<string, number>,
+  auxOverrides?: Record<string, Record<string, boolean>>
+): StateResult | null {
+  const sorted = getSortedProfile(ld.loadProfile || []);
+  const lh = leftHoldProfileSegments(sorted);
+  if (!lh || lh.segments.length === 0) return null;
+
+  const { period, segments } = lh;
+  let intI = 0;
+  let intI2 = 0;
+  let intV = 0;
+  let intP = 0;
+  let peakI = 0;
+  let peakInP = 0;
+
+  for (const s of segments) {
+    const dt = s.tEnd - s.t0;
+    if (!(dt > 0)) continue;
+    intI += s.I * dt;
+    intI2 += s.I * s.I * dt;
+    const ti = timeIndexAtOrBefore(times, s.t0);
+    const Vraw = resolveInputVoltageWithSeriesDrop(nodeId, stateNodeMap, edges, sourceVoltages, ti, times, auxOverrides);
+    const V = Vraw > 0 ? Vraw : 0;
+    intV += V * dt;
+    intP += s.I * V * dt;
+    if (s.I > peakI) peakI = s.I;
+    const pin = s.I * V;
+    if (pin > peakInP) peakInP = pin;
+  }
+
+  for (const p of sorted) {
+    if (p.current > peakI) peakI = p.current;
+    const ti = timeIndexAtOrBefore(times, p.time);
+    const Vraw = resolveInputVoltageWithSeriesDrop(nodeId, stateNodeMap, edges, sourceVoltages, ti, times, auxOverrides);
+    const V = Vraw > 0 ? Vraw : 0;
+    const pin = p.current * V;
+    if (pin > peakInP) peakInP = pin;
+  }
+
+  const inv = 1 / period;
+  const currentOut = intI * inv;
+  const currentRms = Math.sqrt(intI2 * inv);
+  const voltageOut = intV * inv;
+  const inputPower = intP * inv;
+  const outputPower = inputPower;
+  const powerLoss = 0;
+  const efficiency = 1;
+  const auxPower = 0;
+
+  return {
+    inputPower,
+    outputPower,
+    powerLoss,
+    efficiency,
+    voltageOut,
+    currentOut,
+    currentRms,
+    peakCurrent: peakI,
+    peakInputPower: peakInP,
+    auxPower,
+  };
 }
 
 function gcd(a: number, b: number): number {
@@ -439,8 +590,33 @@ function lcm(a: number, b: number): number {
   return Math.abs(a * b) / gcd(a, b);
 }
 
-const MAX_TIMELINE_POINTS = 2000;
+const MAX_TIMELINE_POINTS = 5000;
+const MAX_PROFILE_POINTS = 2000;
 const SAMPLE_COUNT = 1000;
+const MAX_ANALYSIS_OPS = 2_000_000;
+/** Battery sim inner loops are O(steps × T × states); cap T so load doesn't freeze the UI. */
+const MAX_BATTERY_TIMELINE_SAMPLES = 300;
+/**
+ * Battery cycle averaging is intentionally decoupled from the analysis timeline. Steady-state analysis
+ * needs the full unified grid (LCM / CSV); the discharge integrator only needs a coarse sample of one
+ * electrical period to estimate time-averaged pack current at a given terminal voltage.
+ */
+const BATTERY_CYCLE_INPUT_MAX = 56;
+
+function subsampleTimesForBatterySim(times: number[], stateSliceCount = 1): number[] {
+  const div = Math.max(1, stateSliceCount);
+  const cap = Math.min(
+    MAX_BATTERY_TIMELINE_SAMPLES,
+    Math.max(12, Math.floor(2800 / div))
+  );
+  if (times.length <= cap) return times;
+  const out: number[] = [];
+  for (let i = 0; i < cap; i++) {
+    const idx = Math.round((i / (cap - 1)) * (times.length - 1));
+    out.push(times[idx]);
+  }
+  return out;
+}
 const SNAP_TOLERANCE = 0.05;
 
 /**
@@ -496,7 +672,29 @@ function buildUnifiedTimeline(
   const addLoadProfile = (ld: LoadData, key: string) => {
     if (seen.has(key)) return;
     if (ld.loadMode === 'current_profile' && ld.loadProfile.length > 1) {
-      const sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
+      let sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
+
+      // Remove consecutive duplicate current values (redundant for step function)
+      const deduped: LoadProfilePoint[] = [sorted[0]];
+      for (let i = 1; i < sorted.length; i++) {
+        if (Math.abs(sorted[i].current - deduped[deduped.length - 1].current) > 1e-12
+            || i === sorted.length - 1) {
+          deduped.push(sorted[i]);
+        }
+      }
+      sorted = deduped;
+
+      // Downsample if too many points: keep first, last, and uniformly spaced interior
+      if (sorted.length > MAX_PROFILE_POINTS) {
+        const ds: LoadProfilePoint[] = [sorted[0]];
+        const step = (sorted.length - 1) / (MAX_PROFILE_POINTS - 1);
+        for (let i = 1; i < MAX_PROFILE_POINTS - 1; i++) {
+          ds.push(sorted[Math.round(i * step)]);
+        }
+        ds.push(sorted[sorted.length - 1]);
+        sorted = ds;
+      }
+
       const period = sorted[sorted.length - 1].time;
       const hasVariation = sorted.some(p => Math.abs(p.current - sorted[0].current) > 1e-12);
       if (period > 0 && hasVariation) {
@@ -523,6 +721,19 @@ function buildUnifiedTimeline(
   }
 
   if (loadPeriods.length === 0) return [0];
+
+  // Deduplicate points that are extremely close together (< 1ns apart)
+  for (const lp of loadPeriods) {
+    if (lp.points.length <= 1) continue;
+    const merged = [lp.points[0]];
+    for (let i = 1; i < lp.points.length; i++) {
+      if (lp.points[i] - merged[merged.length - 1] >= 1e-9) {
+        merged.push(lp.points[i]);
+      }
+    }
+    lp.points = merged;
+    lp.period = merged[merged.length - 1] > 0 ? merged[merged.length - 1] : lp.period;
+  }
 
   const nonZeroPeriods = loadPeriods.filter(lp => lp.period > 0);
   if (nonZeroPeriods.length === 0) return [0];
@@ -580,12 +791,15 @@ function materializeTimeline(
     }
     const snapped = snappedPeriods[snapIdx++];
     const reps = Math.round(superPeriod / snapped);
-    for (let r = 0; r < reps; r++) {
+    const safeReps = Math.min(Math.max(0, reps), MAX_TIMELINE_POINTS + 2);
+    for (let r = 0; r < safeReps; r++) {
       const offset = r * snapped;
       for (const t of lp.points) {
         times.add(roundTime(offset + t * (snapped / lp.period)));
       }
+      if (times.size > MAX_TIMELINE_POINTS) break;
     }
+    if (times.size > MAX_TIMELINE_POINTS) break;
   }
   if (times.size === 0) times.add(0);
   return Array.from(times).sort((a, b) => a - b);
@@ -595,10 +809,67 @@ function roundTime(t: number): number {
   return Math.round(t * 1e9) / 1e9;
 }
 
+/** Deepest path from any source following edges (target depth); falls back if no sources. */
+function estimatePowerTreeDepth(nodes: Node[], edges: Edge[]): number {
+  const sourceIds = nodes
+    .filter(n => (n.data as unknown as PowerNodeData).type === 'source')
+    .map(n => n.id);
+  if (sourceIds.length === 0) {
+    return Math.max(1, Math.ceil(Math.log2(nodes.length + 1)));
+  }
+  const children = new Map<string, string[]>();
+  for (const e of edges) {
+    let arr = children.get(e.source);
+    if (!arr) {
+      arr = [];
+      children.set(e.source, arr);
+    }
+    arr.push(e.target);
+  }
+  let maxDepth = 1;
+  const stack: { id: string; d: number }[] = sourceIds.map(id => ({ id, d: 1 }));
+  while (stack.length) {
+    const { id, d } = stack.pop()!;
+    if (d > maxDepth) maxDepth = d;
+    const ch = children.get(id);
+    if (!ch) continue;
+    for (const t of ch) stack.push({ id: t, d: d + 1 });
+  }
+  return Math.max(1, maxDepth);
+}
+
+/** Uniformly pick indices from a sorted timeline so analysis cost stays bounded. */
+function subsampleTimelinePoints(sortedTimes: number[], targetCount: number): number[] {
+  const n = sortedTimes.length;
+  if (targetCount < 2 || n <= targetCount) return sortedTimes;
+  const out: number[] = [];
+  for (let i = 0; i < targetCount; i++) {
+    const idx = Math.round((i / (targetCount - 1)) * (n - 1));
+    out.push(sortedTimes[idx]);
+  }
+  const dedup: number[] = [];
+  for (const t of out) {
+    if (dedup.length === 0 || Math.abs(t - dedup[dedup.length - 1]) > 1e-15) dedup.push(t);
+  }
+  return dedup.length >= 2 ? dedup : sortedTimes;
+}
+
+/** Collapse the analysis timeline to a small grid used only by battery discharge (not by runSingleScenario). */
+function buildBatteryCycleTimeline(analysisTimes: number[]): number[] {
+  if (analysisTimes.length <= 2) return analysisTimes;
+  if (analysisTimes.length <= BATTERY_CYCLE_INPUT_MAX) return analysisTimes;
+  return subsampleTimelinePoints(analysisTimes, BATTERY_CYCLE_INPUT_MAX);
+}
+
+const _sortedDischargeCache = new WeakMap<DischargeCurvePoint[], DischargeCurvePoint[]>();
 function interpolateDischargeVoltage(curve: DischargeCurvePoint[], capacityUsedMah: number): number {
   if (curve.length === 0) return 0;
   if (curve.length === 1) return curve[0].voltage;
-  const sorted = [...curve].sort((a, b) => a.capacityMah - b.capacityMah);
+  let sorted = _sortedDischargeCache.get(curve);
+  if (!sorted) {
+    sorted = [...curve].sort((a, b) => a.capacityMah - b.capacityMah);
+    _sortedDischargeCache.set(curve, sorted);
+  }
   if (capacityUsedMah <= sorted[0].capacityMah) return sorted[0].voltage;
   if (capacityUsedMah >= sorted[sorted.length - 1].capacityMah) return sorted[sorted.length - 1].voltage;
   for (let i = 0; i < sorted.length - 1; i++) {
@@ -878,14 +1149,57 @@ function accumulateDischargeStep(
   }
 }
 
+function loadHasTimeVaryingCurrentProfile(ld: LoadData | undefined): boolean {
+  if (!ld || ld.loadMode !== 'current_profile' || !ld.loadProfile || ld.loadProfile.length <= 1) return false;
+  const sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
+  if (!(sorted[sorted.length - 1].time > 0)) return false;
+  const i0 = sorted[0].current;
+  return sorted.some(p => Math.abs(p.current - i0) > 1e-12);
+}
+
+/** All nodes on edges reachable from root (including root). */
+function collectDownstreamNodeIds(rootId: string, edges: Edge[]): Set<string> {
+  const out = new Set<string>();
+  const stack = [rootId];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (out.has(id)) continue;
+    out.add(id);
+    for (const c of getChildren(id, edges)) stack.push(c);
+  }
+  return out;
+}
+
+/** True if any load under this source has a non-flat current_profile in any duty-cycle slice. */
+function batteryPackSeesTimeVaryingCurrent(
+  sourceId: string,
+  edges: Edge[],
+  stateSlices: { nodeMap: Map<string, Node> }[]
+): boolean {
+  const downstream = collectDownstreamNodeIds(sourceId, edges);
+  for (const slice of stateSlices) {
+    for (const nid of downstream) {
+      const n = slice.nodeMap.get(nid);
+      if (!n) continue;
+      const d = n.data as unknown as PowerNodeData;
+      if (d.type === 'load' && loadHasTimeVaryingCurrentProfile(d as LoadData)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Dynamic discharge simulation. `cycleTimes` should be a coarse one-period sample (see buildBatteryCycleTimeline);
+ * it is not required to match the high-resolution `times` grid used for steady-state analysis.
+ */
 function simulateBatteryDischarge(
   sourceId: string,
   sd: PowerSourceData,
   _allNodes: Node[],
   edges: Edge[],
   nodeMap: Map<string, Node>,
-  times: number[],
-  powerStates?: { nodeMap: Map<string, Node>; fractionOfTime: number; auxLoadOverrides?: Record<string, Record<string, boolean>> }[]
+  cycleTimes: number[],
+  stateSlices: { nodeMap: Map<string, Node>; fractionOfTime: number; auxLoadOverrides?: Record<string, Record<string, boolean>> }[]
 ): DischargeResult {
   void _allNodes;
   const batteryMode = sd.batteryMode || 'simple';
@@ -908,39 +1222,51 @@ function simulateBatteryDischarge(
 
   const cutoff = sd.cutoffVoltage || 0;
 
-  const stateSlices = powerStates && powerStates.length > 0
-    ? powerStates
+  const slices = stateSlices.length > 0
+    ? stateSlices
     : [{ nodeMap, fractionOfTime: 1, auxLoadOverrides: undefined as Record<string, Record<string, boolean>> | undefined }];
+
+  const sliceCount = slices.length;
+  let simTimes = subsampleTimesForBatterySim(cycleTimes, sliceCount);
+  if (!batteryPackSeesTimeVaryingCurrent(sourceId, edges, slices)) {
+    simTimes = [0];
+  }
 
   // Compute average current at nominal voltage (for rough lifetime estimate)
   const nomVoltages = new Map<string, number>();
   nomVoltages.set(sourceId, sd.nominalVoltage);
 
   let avgCurrentA = 0;
-  for (const slice of stateSlices) {
-    let sliceCurrent = 0;
-    for (let ti = 0; ti < times.length; ti++) {
-      sliceCurrent += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, times, nomVoltages, slice.auxLoadOverrides);
+  for (const slice of slices) {
+    let sliceWeightedI = 0;
+    let sliceDur = 0;
+    const nTi = simTimes.length;
+    for (let ti = 0; ti < nTi; ti++) {
+      const dt = ti < nTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (nTi > 1 ? 0 : 1);
+      sliceWeightedI += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, nomVoltages, slice.auxLoadOverrides) * dt;
+      sliceDur += dt;
     }
-    sliceCurrent = times.length > 0 ? sliceCurrent / times.length : 0;
-    avgCurrentA += sliceCurrent * slice.fractionOfTime;
+    const sliceAvg = sliceDur > 0 ? sliceWeightedI / sliceDur : 0;
+    avgCurrentA += sliceAvg * slice.fractionOfTime;
   }
   if (avgCurrentA <= 0) return EMPTY_DISCHARGE;
 
   // Simple mode without discharge curves: constant voltage, lifetime = capacity / avg current
   // But still run through states to get proper per-node averages
   const canSimulateVoltage = batteryMode === 'detailed' && curves.some(c => c.points.length >= 2);
+  const rInt = sd.internalResistance || 0;
 
-  const cyclePeriodS = times.length > 1 ? times[times.length - 1] - times[0] : 1;
+  const cyclePeriodS = simTimes.length > 1 ? simTimes[simTimes.length - 1] - simTimes[0] : 1;
   const roughLifetimeH = totalCapacityMah / (avgCurrentA * 1000);
   const dtHours = Math.max(roughLifetimeH / 500, 1 / 3600);
-  const maxSteps = 5000;
+  const numTi = Math.max(1, simTimes.length);
+  const stepsForDischarge = Math.ceil(roughLifetimeH / Math.max(dtHours, 1e-18)) + 200;
+  const maxSteps = Math.min(5000, Math.max(80, stepsForDischarge));
 
   let capacityUsedMah = 0;
   let timeHours = 0;
   const series: BatteryTimeSeriesPoint[] = [];
   const nodeAccum = new Map<string, DischargePowerAccum>();
-  const rInt = sd.internalResistance || 0;
   let prevCurrent = avgCurrentA;
 
   for (let step = 0; step < maxSteps; step++) {
@@ -958,20 +1284,19 @@ function simulateBatteryDischarge(
     // V_terminal = V_oc - I * R_int, but I depends on V_terminal
     let iterCurrent = prevCurrent;
     let voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
-    const numTi = Math.max(1, times.length);
 
     if (rInt > 0) {
-      for (let iter = 0; iter < 5; iter++) {
+      for (let iter = 0; iter < 4; iter++) {
         voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
         if (voltage <= 0) { voltage = 0; break; }
         const sv = new Map<string, number>();
         sv.set(sourceId, voltage);
         let newCurrent = 0;
-        for (const slice of stateSlices) {
+        for (const slice of slices) {
           let sliceAvg = 0;
           for (let ti = 0; ti < numTi; ti++) {
-            const dt = ti < numTi - 1 ? times[ti + 1] - times[ti] : (numTi > 1 ? 0 : 1);
-            sliceAvg += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, times, sv, slice.auxLoadOverrides) * dt;
+            const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
+            sliceAvg += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sv, slice.auxLoadOverrides) * dt;
           }
           sliceAvg = cyclePeriodS > 0 ? sliceAvg / cyclePeriodS : sliceAvg;
           newCurrent += sliceAvg * slice.fractionOfTime;
@@ -989,15 +1314,20 @@ function simulateBatteryDischarge(
 
     // Compute final current and accumulate power metrics
     let stepCurrent = 0;
-    const shouldAccum = step % 10 === 0;
-    for (const slice of stateSlices) {
+    const ACCUM_EVERY = 20;
+    const shouldAccum = step % ACCUM_EVERY === 0;
+    for (const slice of slices) {
       let sliceAvgCurrent = 0;
       for (let ti = 0; ti < numTi; ti++) {
-        const dt = ti < numTi - 1 ? times[ti + 1] - times[ti] : (numTi > 1 ? 0 : 1);
-        const cur = getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, times, sourceVoltages, slice.auxLoadOverrides);
+        const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
+        const cur = getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, slice.auxLoadOverrides);
         sliceAvgCurrent += cur * dt;
         if (shouldAccum) {
-          accumulateDischargeStep(sourceId, slice.nodeMap, edges, ti, times, sourceVoltages, nodeAccum, dtHours * 10 * dt / cyclePeriodS * slice.fractionOfTime, slice.auxLoadOverrides);
+          accumulateDischargeStep(
+            sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, nodeAccum,
+            dtHours * ACCUM_EVERY * dt / cyclePeriodS * slice.fractionOfTime,
+            slice.auxLoadOverrides
+          );
         }
       }
       sliceAvgCurrent = cyclePeriodS > 0 ? sliceAvgCurrent / cyclePeriodS : sliceAvgCurrent;
@@ -1007,7 +1337,7 @@ function simulateBatteryDischarge(
 
     if (stepCurrent <= 0) break;
 
-    if (step % 10 === 0 || step === 0) {
+    if (step % ACCUM_EVERY === 0 || step === 0) {
       series.push({ timeHours, voltage, current: stepCurrent, capacityUsedMah });
     }
 
@@ -1134,6 +1464,20 @@ function computeNodeStateResult(
   times: number[], sourceVoltages: Map<string, number>,
   auxOverrides?: Record<string, Record<string, boolean>>
 ): StateResult {
+  if (d.type === 'load') {
+    const ld = (stateNodeMap.get(nodeId)?.data as unknown as LoadData) ?? (d as LoadData);
+    if (ld.enabled === false) {
+      return {
+        inputPower: 0, outputPower: 0, powerLoss: 0, efficiency: 1,
+        voltageOut: 0, currentOut: 0, currentRms: 0, peakCurrent: 0, peakInputPower: 0, auxPower: 0,
+      };
+    }
+    if (ld.loadMode === 'current_profile' && (ld.loadProfile?.length ?? 0) > 1) {
+      const fast = stateResultFromCurrentProfile(nodeId, ld, stateNodeMap, edges, times, sourceVoltages, auxOverrides);
+      if (fast) return fast;
+    }
+  }
+
   let totalCurrent = 0;
   let totalCurrentSq = 0;
   let totalInputPower = 0;
@@ -1308,7 +1652,35 @@ export function analyzeTree(
     ? powerStates
     : [{ id: 'default', name: 'Default', fractionOfTime: 1, loadSnapshots: {} as Record<string, LoadData> }];
 
-  const times = buildUnifiedTimeline(nodeMap, powerStates);
+  let times = buildUnifiedTimeline(nodeMap, powerStates);
+
+  // Guard against excessive computation: nodes × times × states × scenarios × tree_depth
+  const numScenarios = 1 + sources.filter(s => {
+    const sd = s.data as unknown as PowerSourceData;
+    return (sd.minVoltage != null && sd.minVoltage > 0) || (sd.maxVoltage != null && sd.maxVoltage > 0);
+  }).length;
+  const treeDepthEstimate = Math.max(
+    Math.ceil(Math.log2(nodes.length + 1)),
+    estimatePowerTreeDepth(nodes, edges)
+  );
+  const scenarioCap = Math.min(numScenarios, 3);
+  // computeNodeStateResult runs per node × scenario × state over the full timeline (several tree walks per step).
+  const perNodeStateAggMul = Math.min(16, Math.max(1, 1 + Math.floor(nodes.length / 8)));
+  const denom = Math.max(
+    1,
+    nodes.length * states.length * scenarioCap * treeDepthEstimate * perNodeStateAggMul
+  );
+  const estimatedOps = nodes.length * times.length * states.length * scenarioCap * treeDepthEstimate * perNodeStateAggMul;
+  const maxTimesAllowed = Math.max(2, Math.floor(MAX_ANALYSIS_OPS / denom));
+  if (estimatedOps > MAX_ANALYSIS_OPS && times.length > 2) {
+    const originalLen = times.length;
+    const targetLen = Math.min(times.length, maxTimesAllowed);
+    times = subsampleTimelinePoints(times, targetLen);
+    diagnostics.push({
+      severity: 'warning',
+      message: `Timeline downsampled to ${times.length} points (from ${originalLen}) to prevent UI freeze. Consider simplifying load profiles.`,
+    });
+  }
 
   const scenarios: VoltageScenario[] = ['nom'];
   let hasMin = false;
@@ -1416,6 +1788,12 @@ export function analyzeTree(
   // Compute per-state time series for each scenario. Each state gets its own
   // timeline built from that state's load profiles so the period is correct.
   if (states.length > 1) {
+    const numScenForStatePts = scenarioTimeSeries.length;
+    const stPtsDenom = Math.max(
+      1,
+      numScenForStatePts * states.length * Math.max(1, sources.length) * nodes.length * treeDepthEstimate
+    );
+    const maxStateTimelinePoints = Math.max(2, Math.floor(MAX_ANALYSIS_OPS / stPtsDenom));
     for (const sts of scenarioTimeSeries) {
       const statePoints: Record<string, TimeSeriesPoint[]> = {};
       for (const state of states) {
@@ -1423,7 +1801,10 @@ export function analyzeTree(
         const sv = scenarioStateSourceVoltages.get(`${sts.scenario}:${state.id}`)
           ?? scenarioOCVMaps.get(sts.scenario)!;
         const ocvMap = scenarioOCVMaps.get(sts.scenario)!;
-        const stateTimes = buildUnifiedTimeline(snm);
+        let stateTimes = buildUnifiedTimeline(snm);
+        if (stateTimes.length > maxStateTimelinePoints) {
+          stateTimes = subsampleTimelinePoints(stateTimes, maxStateTimelinePoints);
+        }
         const pts: TimeSeriesPoint[] = [];
         for (let ti = 0; ti < stateTimes.length; ti++) {
           let inputPower = 0;
@@ -1508,7 +1889,8 @@ export function analyzeTree(
     }));
 
     try {
-      const result = simulateBatteryDischarge(s.id, sd, nodes, edges, nodeMap, times, stateSlices);
+      const batteryCycleTimeline = buildBatteryCycleTimeline(times);
+      const result = simulateBatteryDischarge(s.id, sd, nodes, edges, nodeMap, batteryCycleTimeline, stateSlices);
       batteryDischargeResults.set(s.id, result);
       if (result.dischargeSeries.length > 0) {
         batteryDischargeSeries.set(s.id, result.dischargeSeries);

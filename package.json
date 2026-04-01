@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "audit-csv": "node scripts/compare-csv-avg.mjs --peaks",
+    "audit-csv-fixture": "node scripts/compare-csv-avg.mjs --peaks scripts/fixtures/narrow-peaks.csv"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.1",

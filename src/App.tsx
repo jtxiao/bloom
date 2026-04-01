@@ -41,6 +41,13 @@ import type {
   VoltageScenario,
   NoteBullet,
 } from './types';
+import { fingerprintNodeDataForAnalysis, fingerprintPowerStates } from './utils/analysisFingerprint';
+import {
+  cloneNodesForAnalysisWorker,
+  cloneEdgesForAnalysisWorker,
+  clonePowerStatesForWorker,
+} from './utils/cloneForAnalysisWorker';
+import type { AnalysisWorkerResponse } from './workers/analysisWorker.types';
 
 const nodeTypes = { powerNode: PowerNode, groupNode: GroupNode, textNode: TextNode };
 const edgeTypes = { smart: SmartBezierEdge };
@@ -55,6 +62,38 @@ function syncNodeIdCounter(nodes: Node[]) {
     return isNaN(num) ? max : Math.max(max, num);
   }, 0);
   if (maxId >= nodeId) nodeId = maxId;
+}
+
+/** After editing one state's fraction, scale the others so the total is 100% (proportional split). */
+function redistributePowerStateFractions(states: PowerState[], changedId: string, newFraction: number): PowerState[] {
+  const clamped = Math.max(0, Math.min(1, newFraction));
+  const others = states.filter(s => s.id !== changedId);
+  const rest = 1 - clamped;
+  if (others.length === 0) {
+    return states.map(s => (s.id === changedId ? { ...s, fractionOfTime: clamped } : s));
+  }
+  const sumOthers = others.reduce((acc, s) => acc + s.fractionOfTime, 0);
+  const nextById: Record<string, number> = { [changedId]: clamped };
+  if (sumOthers <= 1e-12) {
+    const each = rest / others.length;
+    for (const s of others) nextById[s.id] = each;
+  } else {
+    for (const s of others) {
+      nextById[s.id] = rest * (s.fractionOfTime / sumOthers);
+    }
+  }
+  return states.map(s => ({ ...s, fractionOfTime: nextById[s.id]! }));
+}
+
+function normalizePowerStateFractions(states: PowerState[]): PowerState[] {
+  if (states.length === 0) return states;
+  const sum = states.reduce((acc, s) => acc + s.fractionOfTime, 0);
+  if (sum <= 1e-12) {
+    const each = 1 / states.length;
+    return states.map(s => ({ ...s, fractionOfTime: each }));
+  }
+  if (Math.abs(sum - 1) < 1e-9) return states;
+  return states.map(s => ({ ...s, fractionOfTime: s.fractionOfTime / sum }));
 }
 
 function defaultDataForType(type: string): PowerNodeData {
@@ -224,6 +263,23 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   const [activeStateId, setActiveStateId] = useState('active');
   const activeStateIdRef = useRef(activeStateId);
   const [activeScenario, setActiveScenario] = useState<VoltageScenario>('nom');
+
+  const analysisSeqRef = useRef(0);
+  const analysisWorkerRef = useRef<Worker | null>(null);
+  const nodesSnapshotRef = useRef<Node[]>(nodes);
+  const edgesSnapshotRef = useRef<Edge[]>(edges);
+  const powerStatesSnapshotRef = useRef<PowerState[]>(powerStates);
+  const activeScenarioRef = useRef<VoltageScenario>(activeScenario);
+  const heatmapRef = useRef(heatmap);
+  const themeRef = useRef(theme);
+  const applyAnalysisPackRef = useRef<
+    (
+      r: AnalysisResult[],
+      sts: ScenarioTimeSeries[],
+      batteryEntries: [string, BatteryTimeSeriesPoint[]][],
+      diags: Diagnostic[]
+    ) => void
+  >(() => {});
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string; nodeLabel: string } | null>(null);
   const [alignGuides, setAlignGuides] = useState<{
@@ -1008,122 +1064,217 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   // Auto-run analysis whenever nodes or edges change (fingerprint prevents redundant runs).
   // Fingerprint computation is deferred so selection-only changes don't block the UI.
-  const ANALYSIS_VERSION = 15;
+  const ANALYSIS_VERSION = 16;
+
+  nodesSnapshotRef.current = nodes;
+  edgesSnapshotRef.current = edges;
+  powerStatesSnapshotRef.current = powerStates;
+  activeStateIdRef.current = activeStateId;
+  activeScenarioRef.current = activeScenario;
+  heatmapRef.current = heatmap;
+  themeRef.current = theme;
+
+  applyAnalysisPackRef.current = (
+    r: AnalysisResult[],
+    sts: ScenarioTimeSeries[],
+    batteryEntries: [string, BatteryTimeSeriesPoint[]][],
+    diags: Diagnostic[]
+  ) => {
+    const snapNodes = nodesSnapshotRef.current;
+    const snapEdges = edgesSnapshotRef.current;
+    const snapPowerStates = powerStatesSnapshotRef.current;
+    const snapActiveStateId = activeStateIdRef.current;
+    const snapActiveScenario = activeScenarioRef.current;
+    const snapHeatmap = heatmapRef.current;
+    const snapTheme = themeRef.current;
+    const bds = new Map(batteryEntries);
+
+    try {
+      setResults(r);
+      setDiagnostics(diags);
+      setScenarioTimeSeries(sts);
+      setBatteryDischargeSeries(bds);
+
+      const resultMap = new Map(r.map(res => [res.nodeId, res]));
+      const heatVal = (res: AnalysisResult) => res.type === 'load' ? res.inputPowerAvg : (res.powerLossAvg + (res.auxPowerAvg ?? 0));
+      const maxLoss = Math.max(...r.map(heatVal), 0);
+      setHeatmapMaxLoss(maxLoss);
+      setNodes(nds => {
+        let changed = false;
+        const updated = nds.map(n => {
+          const d = n.data as Record<string, unknown>;
+          const res = resultMap.get(n.id);
+          if (d._analysis === res && d._activeStateId === snapActiveStateId
+            && d._activeScenario === snapActiveScenario && d._heatmap === snapHeatmap && d._maxLoss === maxLoss) {
+            return n;
+          }
+          changed = true;
+          return { ...n, data: { ...d, _analysis: res, _activeStateId: snapActiveStateId, _activeScenario: snapActiveScenario, _heatmap: snapHeatmap, _maxLoss: maxLoss } };
+        });
+        return changed ? updated : nds;
+      });
+
+      const edgeColors = snapTheme === 'light'
+        ? { active: '#2A9D8F', disabled: '#C5BFAE', labelDim: '#999', labelNorm: '#7A7568', labelBg: '#FEFCF8' }
+        : { active: '#4ECDC4', disabled: '#3A3E48', labelDim: '#555', labelNorm: '#8B8F9A', labelBg: '#1E222A' };
+
+      const curState = snapPowerStates.find(s => s.id === snapActiveStateId);
+      const stateOff = new Set<string>();
+      if (curState) {
+        const nm = new Map(snapNodes.map(n => [n.id, n]));
+        const pm = new Map<string, string>();
+        for (const e of snapEdges) pm.set(e.target, e.source);
+        const oc = new Map<string, boolean>();
+        const isOff = (nid: string): boolean => {
+          if (oc.has(nid)) return oc.get(nid)!;
+          const nd = nm.get(nid);
+          if (!nd) { oc.set(nid, false); return false; }
+          const d = nd.data as Record<string, unknown>;
+          const nt = d.type as string;
+          let off = false;
+          if (nt === 'series' || nt === 'converter' || nt === 'load') {
+            if (curState.enabledOverrides && nid in curState.enabledOverrides) {
+              off = !curState.enabledOverrides[nid];
+            } else if ((d as { enabled?: boolean }).enabled === false) {
+              off = true;
+            }
+          }
+          if (!off) {
+            const pid = pm.get(nid);
+            if (pid) off = isOff(pid);
+          }
+          oc.set(nid, off);
+          return off;
+        };
+        for (const n of snapNodes) {
+          if (isOff(n.id)) stateOff.add(n.id);
+        }
+      }
+
+      setEdges(eds => {
+        let eChanged = false;
+        const updatedEdges = eds.map(e => {
+          const sourceResult = resultMap.get(e.source);
+          const targetResult = resultMap.get(e.target);
+          const isEdgeDisabled = stateOff.has(e.source) || stateOff.has(e.target)
+            || sourceResult?.disabled === true || targetResult?.disabled === true;
+          const scenarioStates = snapActiveScenario ? targetResult?.scenarioStateResults?.[snapActiveScenario] : undefined;
+          const stateRes = scenarioStates?.[snapActiveStateId] ?? targetResult?.stateResults?.[snapActiveStateId];
+          const currentA = stateRes?.currentOut ?? targetResult?.currentOut ?? 0;
+          let label: string;
+          if (currentA >= 1) label = `${currentA.toFixed(2)} A`;
+          else if (currentA >= 0.001) label = `${(currentA * 1000).toFixed(1)} mA`;
+          else if (currentA > 0) label = `${(currentA * 1e6).toFixed(0)} uA`;
+          else label = '0 mA';
+
+          if (e.label === label && e.animated === !isEdgeDisabled) return e;
+          eChanged = true;
+
+          const edgeStyle = isEdgeDisabled
+            ? { stroke: edgeColors.disabled, strokeWidth: 1.5, strokeDasharray: '6 3' }
+            : { stroke: edgeColors.active, strokeWidth: 2 };
+          const labelFill = isEdgeDisabled ? edgeColors.labelDim : edgeColors.labelNorm;
+
+          return { ...e, label, animated: !isEdgeDisabled, style: edgeStyle,
+            labelStyle: { fill: labelFill, fontSize: 10, fontWeight: 600 },
+            labelBgStyle: { fill: edgeColors.labelBg, fillOpacity: 0.9 },
+            labelBgPadding: [4, 2] as [number, number] };
+        });
+        return eChanged ? updatedEdges : eds;
+      });
+    } catch (err) {
+      console.error('Post-analysis error:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (typeof Worker === 'undefined') {
+      analysisWorkerRef.current = null;
+      return;
+    }
+    const w = new Worker(new URL('./workers/analysisWorker.ts', import.meta.url), { type: 'module' });
+    analysisWorkerRef.current = w;
+    w.onmessage = (e: MessageEvent<AnalysisWorkerResponse>) => {
+      const msg = e.data;
+      if (msg.type === 'done') {
+        if (msg.id !== analysisSeqRef.current) return;
+        applyAnalysisPackRef.current(
+          msg.results,
+          msg.scenarioTimeSeries,
+          msg.batteryEntries,
+          msg.diagnostics,
+        );
+        setIsCalculating(false);
+      } else if (msg.type === 'error') {
+        if (msg.id !== analysisSeqRef.current) return;
+        const errMsg = msg.message + (msg.stack ? `\n${msg.stack.split('\n').slice(0, 3).join('\n')}` : '');
+        applyAnalysisPackRef.current([], [], [], [{ severity: 'error', message: `Analysis failed: ${errMsg}` }]);
+        setIsCalculating(false);
+      }
+    };
+    w.onerror = (ev) => {
+      console.error('Analysis worker error:', ev);
+      applyAnalysisPackRef.current([], [], [], [{ severity: 'error', message: 'Analysis worker crashed' }]);
+      setIsCalculating(false);
+    };
+    return () => {
+      w.terminate();
+      analysisWorkerRef.current = null;
+    };
+  }, []);
 
   const runAnalysis = useRef<() => void>();
   runAnalysis.current = () => {
     const powerNodes = nodes.filter(n => n.type !== 'groupNode' && n.type !== 'textNode');
-    let r: AnalysisResult[];
-    let sts: ScenarioTimeSeries[];
-    let bds: Map<string, BatteryTimeSeriesPoint[]>;
-    let diags: Diagnostic[] = [];
-    try {
-      const out = analyzeTree(powerNodes, edges, powerStates);
-      r = out.results;
-      sts = out.scenarioTimeSeries;
-      bds = out.batteryDischargeSeries;
-      diags = out.diagnostics;
-    } catch (err) {
-      console.error('Analysis error:', err);
-      const errMsg = err instanceof Error ? `${err.message}\n${err.stack?.split('\n').slice(0, 3).join('\n')}` : String(err);
-      diags = [{ severity: 'error', message: `Analysis failed: ${errMsg}` }];
-      r = [];
-      sts = [];
-      bds = new Map();
+    const id = ++analysisSeqRef.current;
+    const safeNodes = cloneNodesForAnalysisWorker(powerNodes);
+    const safeEdges = cloneEdgesForAnalysisWorker(edges);
+    const safeStates = clonePowerStatesForWorker(powerStates);
+
+    const w = analysisWorkerRef.current;
+    if (!w) {
+      try {
+        const out = analyzeTree(safeNodes, safeEdges, safeStates);
+        if (id !== analysisSeqRef.current) return;
+        applyAnalysisPackRef.current(
+          out.results,
+          out.scenarioTimeSeries,
+          [...out.batteryDischargeSeries.entries()],
+          out.diagnostics,
+        );
+      } catch (err) {
+        console.error('Analysis error:', err);
+        if (id !== analysisSeqRef.current) return;
+        const errMsg = err instanceof Error ? `${err.message}\n${err.stack?.split('\n').slice(0, 3).join('\n')}` : String(err);
+        applyAnalysisPackRef.current([], [], [], [{ severity: 'error', message: `Analysis failed: ${errMsg}` }]);
+      } finally {
+        setIsCalculating(false);
+      }
+      return;
     }
-    setResults(r);
-    setDiagnostics(diags);
-    setScenarioTimeSeries(sts);
-    setBatteryDischargeSeries(bds);
 
-    const resultMap = new Map(r.map(res => [res.nodeId, res]));
-    const heatVal = (res: AnalysisResult) => res.type === 'load' ? res.inputPowerAvg : (res.powerLossAvg + (res.auxPowerAvg ?? 0));
-    const maxLoss = Math.max(...r.map(heatVal), 0);
-    setHeatmapMaxLoss(maxLoss);
-    setNodes(nds => {
-      let changed = false;
-      const updated = nds.map(n => {
-        const d = n.data as Record<string, unknown>;
-        const res = resultMap.get(n.id);
-        if (d._analysis === res && d._activeStateId === activeStateId
-          && d._activeScenario === activeScenario && d._heatmap === heatmap && d._maxLoss === maxLoss) {
-          return n;
+    try {
+      w.postMessage({ type: 'analyze', id, nodes: safeNodes, edges: safeEdges, powerStates: safeStates });
+    } catch (err) {
+      console.error('Worker postMessage failed, falling back to main thread:', err);
+      try {
+        const out = analyzeTree(safeNodes, safeEdges, safeStates);
+        if (id !== analysisSeqRef.current) return;
+        applyAnalysisPackRef.current(
+          out.results,
+          out.scenarioTimeSeries,
+          [...out.batteryDischargeSeries.entries()],
+          out.diagnostics,
+        );
+      } catch (e2) {
+        console.error('Analysis error:', e2);
+        if (id === analysisSeqRef.current) {
+          applyAnalysisPackRef.current([], [], [], [{ severity: 'error', message: 'Analysis failed' }]);
         }
-        changed = true;
-        return { ...n, data: { ...d, _analysis: res, _activeStateId: activeStateId, _activeScenario: activeScenario, _heatmap: heatmap, _maxLoss: maxLoss } };
-      });
-      return changed ? updated : nds;
-    });
-
-    const edgeColors = theme === 'light'
-      ? { active: '#2A9D8F', disabled: '#C5BFAE', labelDim: '#999', labelNorm: '#7A7568', labelBg: '#FEFCF8' }
-      : { active: '#4ECDC4', disabled: '#3A3E48', labelDim: '#555', labelNorm: '#8B8F9A', labelBg: '#1E222A' };
-
-    const curState = powerStates.find(s => s.id === activeStateId);
-    const stateOff = new Set<string>();
-    if (curState) {
-      const nm = new Map(nodes.map(n => [n.id, n]));
-      const pm = new Map<string, string>();
-      for (const e of edges) pm.set(e.target, e.source);
-      const oc = new Map<string, boolean>();
-      const isOff = (nid: string): boolean => {
-        if (oc.has(nid)) return oc.get(nid)!;
-        const nd = nm.get(nid);
-        if (!nd) { oc.set(nid, false); return false; }
-        const d = nd.data as Record<string, unknown>;
-        const nt = d.type as string;
-        let off = false;
-        if (nt === 'series' || nt === 'converter' || nt === 'load') {
-          if (curState.enabledOverrides && nid in curState.enabledOverrides) {
-            off = !curState.enabledOverrides[nid];
-          } else if ((d as { enabled?: boolean }).enabled === false) {
-            off = true;
-          }
-        }
-        if (!off) {
-          const pid = pm.get(nid);
-          if (pid) off = isOff(pid);
-        }
-        oc.set(nid, off);
-        return off;
-      };
-      for (const n of nodes) {
-        if (isOff(n.id)) stateOff.add(n.id);
+      } finally {
+        if (id === analysisSeqRef.current) setIsCalculating(false);
       }
     }
-
-    setEdges(eds => {
-      let eChanged = false;
-      const updatedEdges = eds.map(e => {
-        const sourceResult = resultMap.get(e.source);
-        const targetResult = resultMap.get(e.target);
-        const isEdgeDisabled = stateOff.has(e.source) || stateOff.has(e.target)
-          || sourceResult?.disabled === true || targetResult?.disabled === true;
-        const scenarioStates = activeScenario ? targetResult?.scenarioStateResults?.[activeScenario] : undefined;
-        const stateRes = scenarioStates?.[activeStateId] ?? targetResult?.stateResults?.[activeStateId];
-        const currentA = stateRes?.currentOut ?? targetResult?.currentOut ?? 0;
-        let label: string;
-        if (currentA >= 1) label = `${currentA.toFixed(2)} A`;
-        else if (currentA >= 0.001) label = `${(currentA * 1000).toFixed(1)} mA`;
-        else if (currentA > 0) label = `${(currentA * 1e6).toFixed(0)} uA`;
-        else label = '0 mA';
-
-        if (e.label === label && e.animated === !isEdgeDisabled) return e;
-        eChanged = true;
-
-        const edgeStyle = isEdgeDisabled
-          ? { stroke: edgeColors.disabled, strokeWidth: 1.5, strokeDasharray: '6 3' }
-          : { stroke: edgeColors.active, strokeWidth: 2 };
-        const labelFill = isEdgeDisabled ? edgeColors.labelDim : edgeColors.labelNorm;
-
-        return { ...e, label, animated: !isEdgeDisabled, style: edgeStyle,
-          labelStyle: { fill: labelFill, fontSize: 10, fontWeight: 600 },
-          labelBgStyle: { fill: edgeColors.labelBg, fillOpacity: 0.9 },
-          labelBgPadding: [4, 2] as [number, number] };
-      });
-      return eChanged ? updatedEdges : eds;
-    });
-    setIsCalculating(false);
   };
 
   const analysisRafRef = useRef<number>(0);
@@ -1156,23 +1307,27 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   const analysisFp = (() => {
     const cache = _nodeFpCache;
     const nodeParts: string[] = [];
-    for (const n of nodes) {
-      if (n.type === 'groupNode' || n.type === 'textNode') continue;
+    // React Flow can reorder `nodes` during pan/select/menu interactions; fingerprint must not depend on array order.
+    const sortedPowerNodes = [...nodes]
+      .filter(n => n.type !== 'groupNode' && n.type !== 'textNode')
+      .sort((a, b) => a.id.localeCompare(b.id));
+    for (const n of sortedPowerNodes) {
       const d = n.data as Record<string, unknown>;
       let cached = cache.get(d);
       if (!cached) {
-        const { _analysis, _activeStateId, _activeScenario, _heatmap, _maxLoss, _notes, enabled: _en, label: _lbl, ...rest } = d;
-        void _analysis; void _activeStateId; void _activeScenario; void _heatmap; void _maxLoss; void _notes; void _en; void _lbl;
-        cached = n.id + ':' + JSON.stringify(rest);
+        cached = fingerprintNodeDataForAnalysis(d, n.id);
         cache.set(d, cached);
       }
       nodeParts.push(cached);
     }
     if (_edgesFpCache.ref !== edges) {
-      _edgesFpCache = { ref: edges, fp: edges.map(e => e.source + '-' + e.target).join('|') };
+      _edgesFpCache = {
+        ref: edges,
+        fp: [...edges].map(e => `${e.source}-${e.target}`).sort((a, b) => a.localeCompare(b)).join('|'),
+      };
     }
     if (_statesFpCache.ref !== powerStates) {
-      _statesFpCache = { ref: powerStates, fp: JSON.stringify(powerStates) };
+      _statesFpCache = { ref: powerStates, fp: fingerprintPowerStates(powerStates) };
     }
     return nodeParts.join('|') + '||' + _edgesFpCache.fp
       + '||' + _statesFpCache.fp + '||v' + ANALYSIS_VERSION;
@@ -1300,8 +1455,10 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   const nodeLabelFp = (() => {
     const parts: string[] = [];
-    for (const n of nodes as Node[]) {
-      if (n.type === 'groupNode' || n.type === 'textNode') continue;
+    const sorted = [...(nodes as Node[])]
+      .filter(n => n.type !== 'groupNode' && n.type !== 'textNode')
+      .sort((a, b) => a.id.localeCompare(b.id));
+    for (const n of sorted) {
       parts.push(n.id + ':' + (((n.data as Record<string, unknown>).label as string) || n.id));
     }
     return parts.join('|');
@@ -1679,9 +1836,46 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   }, [nodes.length, doLoadProject]);
 
   const [showStateManager, setShowStateManager] = useState(false);
+  const [stateManagerDraft, setStateManagerDraft] = useState<PowerState[]>([]);
   const [newStateName, setNewStateName] = useState('');
 
-  const addPowerState = useCallback(() => {
+  const openStateManager = useCallback(() => {
+    setStateManagerDraft(JSON.parse(JSON.stringify(powerStates)) as PowerState[]);
+    setShowStateManager(true);
+  }, [powerStates]);
+
+  const closeStateManager = useCallback(() => {
+    const committed = JSON.parse(JSON.stringify(stateManagerDraft)) as PowerState[];
+    setShowStateManager(false);
+    if (committed.length === 0) return;
+
+    const currentActive = activeStateIdRef.current;
+    if (!committed.some(s => s.id === currentActive)) {
+      const targetState = committed[0];
+      const newActiveId = targetState.id;
+      activeStateIdRef.current = newActiveId;
+      setActiveStateId(newActiveId);
+      setNodes(nds => nds.map(n => {
+        const d = n.data as Record<string, unknown>;
+        const nodeType = (d as unknown as PowerNodeData).type;
+        let newData = { ...d };
+        if (targetState.enabledOverrides && n.id in targetState.enabledOverrides &&
+            (nodeType === 'converter' || nodeType === 'series' || nodeType === 'load')) {
+          newData = { ...newData, enabled: targetState.enabledOverrides[n.id] };
+        }
+        if (nodeType !== 'load') return { ...n, data: newData };
+        const snap = targetState.loadSnapshots[n.id];
+        if (snap) {
+          const enabled = targetState.enabledOverrides?.[n.id] ?? (snap.enabled !== false);
+          return { ...n, data: { ...snap, label: d.label, enabled, _analysis: d._analysis, _activeStateId: newActiveId } };
+        }
+        return { ...n, data: newData };
+      }));
+    }
+    setPowerStates(committed);
+  }, [stateManagerDraft, setNodes]);
+
+  const addPowerStateToDraft = useCallback(() => {
     if (!newStateName.trim()) return;
     const id = newStateName.trim().toLowerCase().replace(/\s+/g, '_') + '_' + Date.now();
     const currentSnap = snapshotCurrentLoads();
@@ -1692,72 +1886,50 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         enabledSnap[n.id] = (d as { enabled?: boolean }).enabled !== false;
       }
     }
-    setPowerStates(prev => [...prev, { id, name: newStateName.trim(), fractionOfTime: 0, loadSnapshots: { ...currentSnap }, enabledOverrides: enabledSnap }]);
+    setStateManagerDraft(prev => normalizePowerStateFractions([...prev, { id, name: newStateName.trim(), fractionOfTime: 0, loadSnapshots: { ...currentSnap }, enabledOverrides: enabledSnap }]));
     setNewStateName('');
   }, [newStateName, nodes, snapshotCurrentLoads]);
 
-  const copyPowerState = useCallback((stateId: string) => {
-    const source = powerStates.find(s => s.id === stateId);
-    if (!source) return;
-    let currentSnaps = source.loadSnapshots;
-    let enabledOv = source.enabledOverrides ? { ...source.enabledOverrides } : {};
-    if (stateId === activeStateIdRef.current) {
-      currentSnaps = { ...currentSnaps, ...snapshotCurrentLoads() };
-      for (const n of nodes as unknown as Node[]) {
-        const d = n.data as unknown as PowerNodeData;
-        if (d.type === 'converter' || d.type === 'series' || d.type === 'load') {
-          enabledOv[n.id] = (d as { enabled?: boolean }).enabled !== false;
+  const copyPowerStateInDraft = useCallback((stateId: string) => {
+    setStateManagerDraft(prev => {
+      const source = prev.find(s => s.id === stateId);
+      if (!source) return prev;
+      let currentSnaps = source.loadSnapshots;
+      const enabledOv = source.enabledOverrides ? { ...source.enabledOverrides } : {};
+      if (stateId === activeStateIdRef.current) {
+        currentSnaps = { ...currentSnaps, ...snapshotCurrentLoads() };
+        for (const n of nodes as unknown as Node[]) {
+          const d = n.data as unknown as PowerNodeData;
+          if (d.type === 'converter' || d.type === 'series' || d.type === 'load') {
+            enabledOv[n.id] = (d as { enabled?: boolean }).enabled !== false;
+          }
         }
       }
-    }
-    const newId = source.name.toLowerCase().replace(/\s+/g, '_') + '_copy_' + Date.now();
-    setPowerStates(prev => [...prev, {
-      id: newId,
-      name: `${source.name} (copy)`,
-      fractionOfTime: source.fractionOfTime,
-      loadSnapshots: JSON.parse(JSON.stringify(currentSnaps)),
-      auxLoadOverrides: source.auxLoadOverrides ? JSON.parse(JSON.stringify(source.auxLoadOverrides)) : undefined,
-      enabledOverrides: Object.keys(enabledOv).length > 0 ? { ...enabledOv } : undefined,
-    }]);
-  }, [powerStates, nodes, snapshotCurrentLoads]);
-
-  const removePowerState = useCallback((stateId: string) => {
-    setPowerStates(prev => {
-      const next = prev.filter(s => s.id !== stateId);
-      if (next.length === 0) return prev;
-      if (activeStateIdRef.current === stateId) {
-        const targetState = next[0];
-        const newActiveId = targetState.id;
-        activeStateIdRef.current = newActiveId;
-        setActiveStateId(newActiveId);
-        setNodes(nds => nds.map(n => {
-          const d = n.data as Record<string, unknown>;
-          const nodeType = (d as unknown as PowerNodeData).type;
-          let newData = { ...d };
-          if (targetState.enabledOverrides && n.id in targetState.enabledOverrides &&
-              (nodeType === 'converter' || nodeType === 'series' || nodeType === 'load')) {
-            newData = { ...newData, enabled: targetState.enabledOverrides[n.id] };
-          }
-          if (nodeType !== 'load') return { ...n, data: newData };
-          const snap = targetState.loadSnapshots[n.id];
-          if (snap) {
-            const enabled = targetState.enabledOverrides?.[n.id] ?? (snap.enabled !== false);
-            return { ...n, data: { ...snap, label: d.label, enabled, _analysis: d._analysis, _activeStateId: newActiveId } };
-          }
-          return { ...n, data: newData };
-        }));
-      }
-      return next;
+      const newId = source.name.toLowerCase().replace(/\s+/g, '_') + '_copy_' + Date.now();
+      return normalizePowerStateFractions([...prev, {
+        id: newId,
+        name: `${source.name} (copy)`,
+        fractionOfTime: source.fractionOfTime,
+        loadSnapshots: JSON.parse(JSON.stringify(currentSnaps)),
+        auxLoadOverrides: source.auxLoadOverrides ? JSON.parse(JSON.stringify(source.auxLoadOverrides)) : undefined,
+        enabledOverrides: Object.keys(enabledOv).length > 0 ? { ...enabledOv } : undefined,
+      }]);
     });
-  }, [setNodes]);
+  }, [nodes, snapshotCurrentLoads]);
 
-  const updateStateFraction = useCallback((stateId: string, fraction: number) => {
-    const clamped = Math.max(0, Math.min(1, fraction));
-    setPowerStates(prev => prev.map(s => s.id === stateId ? { ...s, fractionOfTime: clamped } : s));
+  const removePowerStateFromDraft = useCallback((stateId: string) => {
+    setStateManagerDraft(prev => {
+      if (prev.length <= 1) return prev;
+      return normalizePowerStateFractions(prev.filter(s => s.id !== stateId));
+    });
   }, []);
 
-  const renameState = useCallback((stateId: string, name: string) => {
-    setPowerStates(prev => prev.map(s => s.id === stateId ? { ...s, name } : s));
+  const updateDraftStateFraction = useCallback((stateId: string, fraction: number) => {
+    setStateManagerDraft(prev => redistributePowerStateFractions(prev, stateId, fraction));
+  }, []);
+
+  const renameStateInDraft = useCallback((stateId: string, name: string) => {
+    setStateManagerDraft(prev => prev.map(s => s.id === stateId ? { ...s, name } : s));
   }, []);
 
   return (
@@ -1805,8 +1977,8 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
               </button>
             </Tooltip>
           ))}
-          <Tooltip text="Add, remove, or rename power states and adjust their duty cycle percentages">
-            <button className="state-tab state-tab-manage" onClick={() => setShowStateManager(true)}>Manage States</button>
+          <Tooltip text="Add, remove, or rename power states and adjust duty cycles. Analysis runs after you close the panel.">
+            <button className="state-tab state-tab-manage" onClick={openStateManager}>Manage States</button>
           </Tooltip>
           {(() => {
             let hasMin = false, hasMax = false;
@@ -2043,37 +2215,37 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         </div>
       )}
       {showStateManager && (
-        <div className="panel-overlay" onClick={() => setShowStateManager(false)}>
+        <div className="panel-overlay" onClick={closeStateManager}>
           <div className="state-manager-panel" onClick={e => e.stopPropagation()}>
             <div className="panel-header">
               <h2>Power States</h2>
-              <button className="close-btn" onClick={() => setShowStateManager(false)}>X</button>
+              <button className="close-btn" onClick={closeStateManager}>X</button>
             </div>
             <div className="state-manager-body">
-              <p className="state-hint">Define the operating states of your device and how much time is spent in each.</p>
-              {powerStates.map(s => (
+              <p className="state-hint">Define operating states and time in each. Changing a % redistributes the others to total 100%. Close this panel to run analysis.</p>
+              {stateManagerDraft.map(s => (
                 <div key={s.id} className="state-row">
                   <input
                     type="text"
                     value={s.name}
-                    onChange={e => renameState(s.id, e.target.value)}
+                    onChange={e => renameStateInDraft(s.id, e.target.value)}
                     className="state-name-input"
                   />
                   <FractionInput
                     value={s.fractionOfTime}
-                    onChange={v => updateStateFraction(s.id, v)}
+                    onChange={v => updateDraftStateFraction(s.id, v)}
                   />
                   <Tooltip text="Duplicate this state with the same settings">
                     <button
                       className="state-copy-btn"
-                      onClick={() => copyPowerState(s.id)}
+                      onClick={() => copyPowerStateInDraft(s.id)}
                     >Copy</button>
                   </Tooltip>
                   <Tooltip text="Remove this state">
                     <button
                       className="state-remove-btn"
-                      onClick={() => removePowerState(s.id)}
-                      disabled={powerStates.length <= 1}
+                      onClick={() => removePowerStateFromDraft(s.id)}
+                      disabled={stateManagerDraft.length <= 1}
                     >X</button>
                   </Tooltip>
                 </div>
@@ -2084,12 +2256,12 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
                   placeholder="New state name"
                   value={newStateName}
                   onChange={e => setNewStateName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && addPowerState()}
+                  onKeyDown={e => e.key === 'Enter' && addPowerStateToDraft()}
                 />
-                <button onClick={addPowerState} disabled={!newStateName.trim()}>Add</button>
+                <button onClick={addPowerStateToDraft} disabled={!newStateName.trim()}>Add</button>
               </div>
               {(() => {
-                const total = powerStates.reduce((s, st) => s + st.fractionOfTime, 0);
+                const total = stateManagerDraft.reduce((acc, st) => acc + st.fractionOfTime, 0);
                 if (Math.abs(total - 1) > 0.01) {
                   return <p className="state-warning">Time fractions sum to {(total * 100).toFixed(0)}% (should be 100%)</p>;
                 }

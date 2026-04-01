@@ -40,6 +40,51 @@ function paletteColor(index: number): string {
   return PALETTE_COLORS[index % PALETTE_COLORS.length];
 }
 
+/** Same shape as unified timeline points used in results charts */
+type TimeSeriesChartRow = {
+  time: number;
+  inputPower: number;
+  totalLoad: number;
+  inputCurrent: number;
+};
+
+/**
+ * When the series has more points than the chart can draw, uniform decimation
+ * wipes narrow current spikes. Keep per-bucket min/max for input current and
+ * input power (plus endpoints) so peaks and dips survive.
+ */
+function downsampleTimeSeriesKeepingExtrema<T extends TimeSeriesChartRow>(data: T[], maxPoints: number): T[] {
+  if (data.length <= maxPoints) return data;
+  const n = data.length;
+  const interior = n - 2;
+  const numBuckets = Math.max(1, Math.floor((maxPoints - 2) / 4));
+  const picked = new Map<number, T>();
+  const add = (i: number) => {
+    const row = data[i];
+    picked.set(row.time, row);
+  };
+  add(0);
+  for (let b = 0; b < numBuckets; b++) {
+    const start = 1 + Math.floor((b * interior) / numBuckets);
+    const end = 1 + Math.floor(((b + 1) * interior) / numBuckets) - 1;
+    if (start > end) continue;
+    let minIc = start;
+    let maxIc = start;
+    let minIp = start;
+    let maxIp = start;
+    for (let j = start; j <= end; j++) {
+      if (data[j].inputCurrent < data[minIc].inputCurrent) minIc = j;
+      if (data[j].inputCurrent > data[maxIc].inputCurrent) maxIc = j;
+      if (data[j].inputPower < data[minIp].inputPower) minIp = j;
+      if (data[j].inputPower > data[maxIp].inputPower) maxIp = j;
+    }
+    const idxs = [minIc, maxIc, minIp, maxIp];
+    for (const idx of idxs) add(idx);
+  }
+  add(n - 1);
+  return [...picked.values()].sort((a, b) => a.time - b.time);
+}
+
 function formatPowerSigFigs(watts: number): string {
   const abs = Math.abs(watts);
   if (abs === 0) return '0 W';
@@ -235,7 +280,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
     const last = rawTimeSeries[rawTimeSeries.length - 1];
     twoCycles.push({ ...last, time: endTime });
 
-    const MAX_DISPLAY = 600;
+    const MAX_DISPLAY = 4000;
     if (twoCycles.length <= MAX_DISPLAY) return twoCycles;
 
     const kept: typeof twoCycles = [twoCycles[0]];
@@ -255,8 +300,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
     }
 
     if (kept.length <= MAX_DISPLAY) return kept;
-    const step = Math.ceil(kept.length / MAX_DISPLAY);
-    return kept.filter((_, i) => i % step === 0 || i === kept.length - 1);
+    return downsampleTimeSeriesKeepingExtrema(kept, MAX_DISPLAY);
   })();
 
   const timeMax = activeTimeSeries.length > 0 ? activeTimeSeries[activeTimeSeries.length - 1].time : 0;
@@ -585,7 +629,7 @@ function ResultsPanel({ results, scenarioTimeSeries, batteryDischargeSeries, onC
                   <td>{formatPowerSigFigs(inp)}</td>
                   <td>{isLoad ? '—' : formatPowerSigFigs(getNodePower(r, i, 'outputPower'))}</td>
                   <td>{auxVal > 0 ? formatPowerSigFigs(auxVal) : '—'}</td>
-                  <td>{isLoad ? formatPowerSigFigs(inp) : formatPowerSigFigs(getNodePower(r, i, 'powerLoss'))}</td>
+                  <td className="loss-cell">{isLoad ? formatPowerSigFigs(inp) : formatPowerSigFigs(getNodePower(r, i, 'powerLoss'))}</td>
                   <td>{isLoad ? '—' : `${(getNodePower(r, i, 'efficiency') * 100).toFixed(1)}%`}</td>
                 </tr>
               );
