@@ -128,6 +128,17 @@ function getParent(nodeId: string, edges: Edge[]): string | null {
   return _parentMap!.get(nodeId) ?? null;
 }
 
+/**
+ * Source id → open-circuit voltage for the active analysis scenario (or battery step).
+ * When set, direct source→load branches use OCV + (R_series + R_i) for current, not terminal V alone
+ * (avoids 0 A when Ri drops the terminal but the pack can still supply current).
+ */
+let _solveSourceOCV: Map<string, number> | undefined;
+
+function getSolveSourceOCV(): Map<string, number> | undefined {
+  return _solveSourceOCV;
+}
+
 function resolveInputVoltage(
   nodeId: string,
   nodes: Map<string, Node>,
@@ -194,6 +205,169 @@ function resolveInputVoltageWithSeriesDrop(
   return voltage;
 }
 
+/**
+ * Walk load→parents until source or converter. Sum resistive series R and source Ri (Ω).
+ * Stops at a converter (Ri and upstream series do not series-divide the load node’s Vout).
+ */
+function sumPathOhmsForLoadUpstreamClamp(
+  loadNodeId: string,
+  nodes: Map<string, Node>,
+  edges: Edge[],
+): number {
+  let sum = 0;
+  let curId = loadNodeId;
+  while (true) {
+    const parentId = getParent(curId, edges);
+    if (!parentId) break;
+    const parentNode = nodes.get(parentId);
+    if (!parentNode) break;
+    const pd = parentNode.data as unknown as PowerNodeData;
+    if (pd.type === 'source') {
+      sum += (pd as PowerSourceData).internalResistance || 0;
+      break;
+    }
+    if (pd.type === 'converter') {
+      break;
+    }
+    if (pd.type === 'series') {
+      const sd = pd as SeriesElementData;
+      if (sd.enabled !== false && sd.seriesMode !== 'diode' && (sd.resistance || 0) > 0) {
+        sum += sd.resistance || 0;
+      }
+    }
+    curId = parentId;
+  }
+  return sum;
+}
+
+/**
+ * Thevenin open voltage for load current math: OCV of feeding source if path has no converter;
+ * otherwise terminal voltage at the load (converter output, etc.).
+ */
+function resolveOpenCircuitVoltageForLoadClamp(
+  loadNodeId: string,
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  sourceVoltagesTerminal: Map<string, number>,
+  sourceOCV?: Map<string, number>,
+): number {
+  let curId = loadNodeId;
+  while (true) {
+    const parentId = getParent(curId, edges);
+    if (!parentId) return resolveInputVoltage(loadNodeId, nodes, edges, sourceVoltagesTerminal);
+    const parentNode = nodes.get(parentId);
+    if (!parentNode) return resolveInputVoltage(loadNodeId, nodes, edges, sourceVoltagesTerminal);
+    const pd = parentNode.data as unknown as PowerNodeData;
+    if (pd.type === 'converter') {
+      return resolveInputVoltage(loadNodeId, nodes, edges, sourceVoltagesTerminal);
+    }
+    if (pd.type === 'source') {
+      const sd = pd as PowerSourceData;
+      return sourceOCV?.get(parentId) ?? getSolveSourceOCV()?.get(parentId) ?? sd.nominalVoltage;
+    }
+    curId = parentId;
+  }
+}
+
+/**
+ * Load current consistent with upstream resistive drops: for a resistor load,
+ * I = V_oc / (R_path + R_load); for fixed / profile loads, I = min(I_req, V_oc / R_path)
+ * when R_path > 0. Uses source OCV (when available) plus R_i + series R on a direct source path.
+ */
+function loadBranchCurrentAtTime(
+  nodeId: string,
+  ld: LoadData,
+  timeIdx: number,
+  allTimes: number[],
+  sourceVoltagesTerminal: Map<string, number>,
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  /** When set, use this as the profile segment current instead of sampling at `allTimes[timeIdx]`. */
+  profileCurrentOverride?: number,
+): number {
+  if (ld.enabled === false) return 0;
+  const ocvMap = getSolveSourceOCV();
+  const vTh = resolveOpenCircuitVoltageForLoadClamp(nodeId, nodes, edges, sourceVoltagesTerminal, ocvMap);
+  if (vTh <= 0) return 0;
+  const rPath = sumPathOhmsForLoadUpstreamClamp(nodeId, nodes, edges);
+  const t = allTimes[timeIdx];
+  const mode = ld.loadMode || 'current_profile';
+  if (mode === 'resistor') {
+    const rL = ld.resistance || 0;
+    if (rL <= 0) return 0;
+    return rPath > 0 ? vTh / (rPath + rL) : vTh / rL;
+  }
+  const iWant = mode === 'fixed_current'
+    ? (ld.fixedCurrent || 0)
+    : (profileCurrentOverride != null
+      ? profileCurrentOverride
+      : getCurrentAtTime(ld.loadProfile || [], t));
+  if (rPath > 0) return Math.min(iWant, vTh / rPath);
+  return iWant;
+}
+
+const LOAD_UPSTREAM_CLAMP_EPS = 1e-12;
+
+function formatAmperesForDiag(a: number): string {
+  const x = Math.abs(a);
+  if (x >= 1) return `${a.toFixed(3)} A`;
+  if (x >= 1e-3) return `${(a * 1e3).toFixed(2)} mA`;
+  return `${(a * 1e6).toFixed(1)} µA`;
+}
+
+function formatOhmsForDiag(r: number): string {
+  if (r >= 1) return `${r.toFixed(3)} Ω`;
+  return `${(r * 1e3).toFixed(2)} mΩ`;
+}
+
+/** True when fixed or profile load asks for more than V÷R_path (analysis caps current). */
+function isLoadCappedByUpstreamSeriesR(
+  nodeId: string,
+  ld: LoadData,
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  sourceVoltagesTerminal: Map<string, number>,
+  sourceOCV: Map<string, number>,
+): boolean {
+  if (ld.enabled === false) return false;
+  const mode = ld.loadMode || 'current_profile';
+  if (mode === 'resistor') return false;
+  const rPath = sumPathOhmsForLoadUpstreamClamp(nodeId, nodes, edges);
+  if (!(rPath > 0)) return false;
+  const vTh = resolveOpenCircuitVoltageForLoadClamp(nodeId, nodes, edges, sourceVoltagesTerminal, sourceOCV);
+  if (!(vTh > 0)) return false;
+  const iMax = vTh / rPath;
+  if (mode === 'fixed_current') {
+    return (ld.fixedCurrent || 0) > iMax + LOAD_UPSTREAM_CLAMP_EPS;
+  }
+  for (const p of ld.loadProfile || []) {
+    if (p.current > iMax + LOAD_UPSTREAM_CLAMP_EPS) return true;
+  }
+  return false;
+}
+
+function loadUpstreamClampDiagnosticMessage(
+  nodeId: string,
+  ld: LoadData,
+  nodes: Map<string, Node>,
+  edges: Edge[],
+  sourceVoltagesTerminal: Map<string, number>,
+  sourceOCV: Map<string, number>,
+): string {
+  const rPath = sumPathOhmsForLoadUpstreamClamp(nodeId, nodes, edges);
+  const vTh = resolveOpenCircuitVoltageForLoadClamp(nodeId, nodes, edges, sourceVoltagesTerminal, sourceOCV);
+  const iMax = rPath > 0 && vTh > 0 ? vTh / rPath : 0;
+  const mode = ld.loadMode || 'current_profile';
+  const rStr = formatOhmsForDiag(rPath);
+  const vStr = vTh.toFixed(2);
+  const imStr = formatAmperesForDiag(iMax);
+  if (mode === 'fixed_current') {
+    const iw = ld.fixedCurrent || 0;
+    return `Load "${ld.label}" requests ${formatAmperesForDiag(iw)} but upstream resistive path (~${rStr}) with ~${vStr}V open-circuit (before I·R drops) allows at most ${imStr} before the rail reaches 0V; analysis uses the capped current.`;
+  }
+  return `Load "${ld.label}" current profile exceeds ${imStr} in at least one segment; upstream resistive path ~${rStr} with ~${vStr}V open-circuit (before I·R drops) would collapse the rail without limiting; analysis uses the capped current.`;
+}
+
 function getChildInputVoltage(
   childId: string,
   childData: PowerNodeData,
@@ -223,8 +397,7 @@ function sumTreeCurrent(
 
   if (data.type === 'load') {
     if ((data as LoadData).enabled === false) return 0;
-    const lv = resolveInputVoltageWithSeriesDrop(nodeId, nodes, edges, sourceVoltages, timeIdx, allTimes, auxOverrides);
-    return lv > 0 ? getLoadCurrent(data as LoadData, allTimes[timeIdx], lv) : 0;
+    return getNodeCurrentDraw(nodeId, nodes, edges, timeIdx, allTimes, sourceVoltages, auxOverrides);
   }
   if (data.type === 'converter') {
     if ((data as PowerConverterData).enabled === false) return 0;
@@ -274,17 +447,6 @@ function getAuxLoadCurrent(
   return total;
 }
 
-function getLoadCurrent(ld: LoadData, time: number, voltage?: number): number {
-  if (ld.loadMode === 'resistor') {
-    const v = voltage ?? 0;
-    return ld.resistance > 0 ? v / ld.resistance : 0;
-  }
-  if (ld.loadMode === 'fixed_current') {
-    return ld.fixedCurrent || 0;
-  }
-  return getCurrentAtTime(ld.loadProfile, time);
-}
-
 // Voltage resolver that skips series I*R estimation to avoid mutual recursion
 // with _getNodeCurrentDrawNoSeriesDrop. Identical to resolveInputVoltage except
 // for resistive series nodes, where it returns upstream voltage without I*R drop.
@@ -298,9 +460,7 @@ function _getNodeCurrentDrawNoSeriesDrop(
   const data = node.data as unknown as PowerNodeData;
   if (data.type === 'load') {
     if ((data as LoadData).enabled === false) return 0;
-    const loadV = resolveInputVoltage(nodeId, nodes, edges, sourceVoltages);
-    if (loadV <= 0) return 0;
-    return getLoadCurrent(data as LoadData, allTimes[timeIdx], loadV);
+    return loadBranchCurrentAtTime(nodeId, data as LoadData, timeIdx, allTimes, sourceVoltages, nodes, edges);
   }
   if (data.type === 'series') {
     if ((data as SeriesElementData).enabled === false) return 0;
@@ -346,9 +506,7 @@ function getNodeCurrentDraw(
 
   if (data.type === 'load') {
     if ((data as LoadData).enabled === false) return 0;
-    const loadV = resolveInputVoltage(nodeId, nodes, edges, sourceVoltages);
-    if (loadV <= 0) return 0;
-    return getLoadCurrent(data as LoadData, allTimes[timeIdx], loadV);
+    return loadBranchCurrentAtTime(nodeId, data as LoadData, timeIdx, allTimes, sourceVoltages, nodes, edges);
   }
 
   if (data.type === 'series') {
@@ -533,24 +691,26 @@ function stateResultFromCurrentProfile(
   for (const s of segments) {
     const dt = s.tEnd - s.t0;
     if (!(dt > 0)) continue;
-    intI += s.I * dt;
-    intI2 += s.I * s.I * dt;
     const ti = timeIndexAtOrBefore(times, s.t0);
+    const iEff = loadBranchCurrentAtTime(nodeId, ld, ti, times, sourceVoltages, stateNodeMap, edges, s.I);
     const Vraw = resolveInputVoltageWithSeriesDrop(nodeId, stateNodeMap, edges, sourceVoltages, ti, times, auxOverrides);
     const V = Vraw > 0 ? Vraw : 0;
+    intI += iEff * dt;
+    intI2 += iEff * iEff * dt;
     intV += V * dt;
-    intP += s.I * V * dt;
-    if (s.I > peakI) peakI = s.I;
-    const pin = s.I * V;
+    intP += iEff * V * dt;
+    if (iEff > peakI) peakI = iEff;
+    const pin = iEff * V;
     if (pin > peakInP) peakInP = pin;
   }
 
   for (const p of sorted) {
-    if (p.current > peakI) peakI = p.current;
     const ti = timeIndexAtOrBefore(times, p.time);
+    const iEff = loadBranchCurrentAtTime(nodeId, ld, ti, times, sourceVoltages, stateNodeMap, edges, p.current);
+    if (iEff > peakI) peakI = iEff;
     const Vraw = resolveInputVoltageWithSeriesDrop(nodeId, stateNodeMap, edges, sourceVoltages, ti, times, auxOverrides);
     const V = Vraw > 0 ? Vraw : 0;
-    const pin = p.current * V;
+    const pin = iEff * V;
     if (pin > peakInP) peakInP = pin;
   }
 
@@ -1060,15 +1220,14 @@ function accumulateDischargeStep(
   if (data.type === 'load') {
     const ld = data as LoadData;
     if (ld.enabled === false) return;
-    const loadV = resolveInputVoltage(nodeId, nodes, edges, sourceVoltages);
-    if (loadV <= 0) return;
-    const cur = getLoadCurrent(ld, allTimes[timeIdx], loadV);
-    const power = cur * loadV;
+    const cur = getNodeCurrentDraw(nodeId, nodes, edges, timeIdx, allTimes, sourceVoltages, auxOverrides);
+    const vTerm = resolveInputVoltageWithSeriesDrop(nodeId, nodes, edges, sourceVoltages, timeIdx, allTimes, auxOverrides);
+    const power = cur * vTerm;
     acc.inputPower += power * dtHours;
     acc.outputPower += power * dtHours;
     acc.current += cur * dtHours;
     acc.currentSq += cur * cur * dtHours;
-    acc.voltageOut += loadV * dtHours;
+    acc.voltageOut += vTerm * dtHours;
     return;
   }
 
@@ -1237,17 +1396,25 @@ function simulateBatteryDischarge(
   nomVoltages.set(sourceId, sd.nominalVoltage);
 
   let avgCurrentA = 0;
-  for (const slice of slices) {
-    let sliceWeightedI = 0;
-    let sliceDur = 0;
-    const nTi = simTimes.length;
-    for (let ti = 0; ti < nTi; ti++) {
-      const dt = ti < nTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (nTi > 1 ? 0 : 1);
-      sliceWeightedI += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, nomVoltages, slice.auxLoadOverrides) * dt;
-      sliceDur += dt;
+  {
+    const prevBatOcv = _solveSourceOCV;
+    _solveSourceOCV = nomVoltages;
+    try {
+      for (const slice of slices) {
+        let sliceWeightedI = 0;
+        let sliceDur = 0;
+        const nTi = simTimes.length;
+        for (let ti = 0; ti < nTi; ti++) {
+          const dt = ti < nTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (nTi > 1 ? 0 : 1);
+          sliceWeightedI += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, nomVoltages, slice.auxLoadOverrides) * dt;
+          sliceDur += dt;
+        }
+        const sliceAvg = sliceDur > 0 ? sliceWeightedI / sliceDur : 0;
+        avgCurrentA += sliceAvg * slice.fractionOfTime;
+      }
+    } finally {
+      _solveSourceOCV = prevBatOcv;
     }
-    const sliceAvg = sliceDur > 0 ? sliceWeightedI / sliceDur : 0;
-    avgCurrentA += sliceAvg * slice.fractionOfTime;
   }
   if (avgCurrentA <= 0) return EMPTY_DISCHARGE;
 
@@ -1279,78 +1446,86 @@ function simulateBatteryDischarge(
 
     if (capacityUsedMah >= totalCapacityMah) break;
 
-    // Iteratively solve for self-consistent (voltage, current) pair
-    // (capacity check is also done at end of loop to prevent overshoot)
-    // V_terminal = V_oc - I * R_int, but I depends on V_terminal
-    let iterCurrent = prevCurrent;
-    let voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
+    const stepOcvMap = new Map<string, number>();
+    stepOcvMap.set(sourceId, ocVoltage);
+    const prevStepOcvF = _solveSourceOCV;
+    _solveSourceOCV = stepOcvMap;
+    try {
+      // Iteratively solve for self-consistent (voltage, current) pair
+      // (capacity check is also done at end of loop to prevent overshoot)
+      // V_terminal = V_oc - I * R_int, but I depends on V_terminal
+      let iterCurrent = prevCurrent;
+      let voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
 
-    if (rInt > 0) {
-      for (let iter = 0; iter < 4; iter++) {
-        voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
-        if (voltage <= 0) { voltage = 0; break; }
-        const sv = new Map<string, number>();
-        sv.set(sourceId, voltage);
-        let newCurrent = 0;
-        for (const slice of slices) {
-          let sliceAvg = 0;
-          for (let ti = 0; ti < numTi; ti++) {
-            const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
-            sliceAvg += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sv, slice.auxLoadOverrides) * dt;
+      if (rInt > 0) {
+        for (let iter = 0; iter < 4; iter++) {
+          voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
+          if (voltage <= 0) { voltage = 0; break; }
+          const sv = new Map<string, number>();
+          sv.set(sourceId, voltage);
+          let newCurrent = 0;
+          for (const slice of slices) {
+            let sliceAvg = 0;
+            for (let ti = 0; ti < numTi; ti++) {
+              const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
+              sliceAvg += getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sv, slice.auxLoadOverrides) * dt;
+            }
+            sliceAvg = cyclePeriodS > 0 ? sliceAvg / cyclePeriodS : sliceAvg;
+            newCurrent += sliceAvg * slice.fractionOfTime;
           }
-          sliceAvg = cyclePeriodS > 0 ? sliceAvg / cyclePeriodS : sliceAvg;
-          newCurrent += sliceAvg * slice.fractionOfTime;
+          if (Math.abs(newCurrent - iterCurrent) < 1e-6) break;
+          iterCurrent = newCurrent;
         }
-        if (Math.abs(newCurrent - iterCurrent) < 1e-6) break;
-        iterCurrent = newCurrent;
+        voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
       }
-      voltage = Math.max(0, ocVoltage - iterCurrent * rInt);
-    }
 
-    if (voltage <= cutoff && cutoff > 0) break;
+      if (voltage <= cutoff && cutoff > 0) break;
 
-    const sourceVoltages = new Map<string, number>();
-    sourceVoltages.set(sourceId, voltage);
+      const sourceVoltages = new Map<string, number>();
+      sourceVoltages.set(sourceId, voltage);
 
-    // Compute final current and accumulate power metrics
-    let stepCurrent = 0;
-    const ACCUM_EVERY = 20;
-    const shouldAccum = step % ACCUM_EVERY === 0;
-    for (const slice of slices) {
-      let sliceAvgCurrent = 0;
-      for (let ti = 0; ti < numTi; ti++) {
-        const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
-        const cur = getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, slice.auxLoadOverrides);
-        sliceAvgCurrent += cur * dt;
-        if (shouldAccum) {
-          accumulateDischargeStep(
-            sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, nodeAccum,
-            dtHours * ACCUM_EVERY * dt / cyclePeriodS * slice.fractionOfTime,
-            slice.auxLoadOverrides
-          );
+      // Compute final current and accumulate power metrics
+      let stepCurrent = 0;
+      const ACCUM_EVERY = 20;
+      const shouldAccum = step % ACCUM_EVERY === 0;
+      for (const slice of slices) {
+        let sliceAvgCurrent = 0;
+        for (let ti = 0; ti < numTi; ti++) {
+          const dt = ti < numTi - 1 ? simTimes[ti + 1] - simTimes[ti] : (numTi > 1 ? 0 : 1);
+          const cur = getNodeCurrentDraw(sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, slice.auxLoadOverrides);
+          sliceAvgCurrent += cur * dt;
+          if (shouldAccum) {
+            accumulateDischargeStep(
+              sourceId, slice.nodeMap, edges, ti, simTimes, sourceVoltages, nodeAccum,
+              dtHours * ACCUM_EVERY * dt / cyclePeriodS * slice.fractionOfTime,
+              slice.auxLoadOverrides
+            );
+          }
         }
+        sliceAvgCurrent = cyclePeriodS > 0 ? sliceAvgCurrent / cyclePeriodS : sliceAvgCurrent;
+        stepCurrent += sliceAvgCurrent * slice.fractionOfTime;
       }
-      sliceAvgCurrent = cyclePeriodS > 0 ? sliceAvgCurrent / cyclePeriodS : sliceAvgCurrent;
-      stepCurrent += sliceAvgCurrent * slice.fractionOfTime;
-    }
-    prevCurrent = stepCurrent;
+      prevCurrent = stepCurrent;
 
-    if (stepCurrent <= 0) break;
+      if (stepCurrent <= 0) break;
 
-    if (step % ACCUM_EVERY === 0 || step === 0) {
-      series.push({ timeHours, voltage, current: stepCurrent, capacityUsedMah });
-    }
+      if (step % ACCUM_EVERY === 0 || step === 0) {
+        series.push({ timeHours, voltage, current: stepCurrent, capacityUsedMah });
+      }
 
-    const capacityStep = stepCurrent * 1000 * dtHours;
-    if (capacityUsedMah + capacityStep >= totalCapacityMah) {
-      const remaining = totalCapacityMah - capacityUsedMah;
-      const fractionalDt = remaining / (stepCurrent * 1000);
-      capacityUsedMah = totalCapacityMah;
-      timeHours += fractionalDt;
-      break;
+      const capacityStep = stepCurrent * 1000 * dtHours;
+      if (capacityUsedMah + capacityStep >= totalCapacityMah) {
+        const remaining = totalCapacityMah - capacityUsedMah;
+        const fractionalDt = remaining / (stepCurrent * 1000);
+        capacityUsedMah = totalCapacityMah;
+        timeHours += fractionalDt;
+        break;
+      }
+      capacityUsedMah += capacityStep;
+      timeHours += dtHours;
+    } finally {
+      _solveSourceOCV = prevStepOcvF;
     }
-    capacityUsedMah += capacityStep;
-    timeHours += dtHours;
   }
 
   if (canSimulateVoltage) {
@@ -1379,6 +1554,10 @@ function runSingleScenario(
   times: number[], sourceVoltagesOCV: Map<string, number>
 ): { nodeResults: Map<string, ScenarioResult>; timeSeries: TimeSeriesPoint[] } {
   const sources = allNodes.filter(n => (n.data as unknown as PowerNodeData).type === 'source');
+  const ocvSnapshot = new Map(sourceVoltagesOCV);
+  const prevSolveOcv = _solveSourceOCV;
+  _solveSourceOCV = ocvSnapshot;
+  try {
 
   // Iteratively solve for terminal voltages accounting for I*R drop at sources
   const sourceVoltages = new Map(sourceVoltagesOCV);
@@ -1429,8 +1608,9 @@ function runSingleScenario(
     allNodes.forEach(n => {
       const d = n.data as unknown as PowerNodeData;
       if (d.type === 'load') {
-        const loadV = resolveInputVoltage(n.id, nodeMap, edges, sourceVoltages);
-        totalLoad += getLoadCurrent(d as LoadData, times[ti], loadV) * loadV;
+        const cur = getNodeCurrentDraw(n.id, nodeMap, edges, ti, times, sourceVoltages);
+        const vTerm = resolveInputVoltageWithSeriesDrop(n.id, nodeMap, edges, sourceVoltages, ti, times);
+        totalLoad += cur * vTerm;
       }
     });
 
@@ -1456,6 +1636,9 @@ function runSingleScenario(
   });
 
   return { nodeResults, timeSeries };
+  } finally {
+    _solveSourceOCV = prevSolveOcv;
+  }
 }
 
 function computeNodeStateResult(
@@ -1521,9 +1704,7 @@ function computeNodeStateResult(
     }
 
     if (d.type === 'load') {
-      const ld = stateNodeMap.get(nodeId);
-      const loadData = ld ? ld.data as unknown as LoadData : d as LoadData;
-      stepCurrent = stepVoltageOut > 0 ? getLoadCurrent(loadData, times[ti], stepVoltageOut) : 0;
+      stepCurrent = getNodeCurrentDraw(nodeId, stateNodeMap, edges, ti, times, sourceVoltages, auxOverrides);
     } else if (d.type === 'source' || d.type === 'series') {
       stepCurrent = sumTreeCurrent(nodeId, stateNodeMap, edges, ti, times, sourceVoltages, auxOverrides);
     } else {
@@ -1758,30 +1939,36 @@ export function analyzeTree(
   for (const scenario of scenarios) {
     const ocvMap = scenarioOCVMaps.get(scenario)!;
     for (const state of states) {
-      const snm = stateNodeMaps.get(state.id)!;
-      const sv = new Map(ocvMap);
-      for (let iter = 0; iter < 5; iter++) {
-        let maxDelta = 0;
-        for (const s of sources) {
-          const sd = s.data as unknown as PowerSourceData;
-          const rInt = sd.internalResistance || 0;
-          if (rInt <= 0) continue;
-          const ocv = ocvMap.get(s.id) ?? sd.nominalVoltage;
-          let avgCurrent = 0;
-          const totalDur = times.length > 1 ? times[times.length - 1] - times[0] : 1;
-          for (let ti = 0; ti < times.length; ti++) {
-            const dt = ti < times.length - 1 ? times[ti + 1] - times[ti] : (times.length > 1 ? 0 : 1);
-            avgCurrent += getNodeCurrentDraw(s.id, snm, edges, ti, times, sv, state.auxLoadOverrides) * dt;
+      const prevOcvFrame = _solveSourceOCV;
+      _solveSourceOCV = ocvMap;
+      try {
+        const snm = stateNodeMaps.get(state.id)!;
+        const sv = new Map(ocvMap);
+        for (let iter = 0; iter < 5; iter++) {
+          let maxDelta = 0;
+          for (const s of sources) {
+            const sd = s.data as unknown as PowerSourceData;
+            const rInt = sd.internalResistance || 0;
+            if (rInt <= 0) continue;
+            const ocv = ocvMap.get(s.id) ?? sd.nominalVoltage;
+            let avgCurrent = 0;
+            const totalDur = times.length > 1 ? times[times.length - 1] - times[0] : 1;
+            for (let ti = 0; ti < times.length; ti++) {
+              const dt = ti < times.length - 1 ? times[ti + 1] - times[ti] : (times.length > 1 ? 0 : 1);
+              avgCurrent += getNodeCurrentDraw(s.id, snm, edges, ti, times, sv, state.auxLoadOverrides) * dt;
+            }
+            avgCurrent = totalDur > 0 ? avgCurrent / totalDur : avgCurrent;
+            const terminal = Math.max(0, ocv - avgCurrent * rInt);
+            const prev = sv.get(s.id) ?? ocv;
+            maxDelta = Math.max(maxDelta, Math.abs(terminal - prev));
+            sv.set(s.id, terminal);
           }
-          avgCurrent = totalDur > 0 ? avgCurrent / totalDur : avgCurrent;
-          const terminal = Math.max(0, ocv - avgCurrent * rInt);
-          const prev = sv.get(s.id) ?? ocv;
-          maxDelta = Math.max(maxDelta, Math.abs(terminal - prev));
-          sv.set(s.id, terminal);
+          if (maxDelta < 1e-6) break;
         }
-        if (maxDelta < 1e-6) break;
+        scenarioStateSourceVoltages.set(`${scenario}:${state.id}`, sv);
+      } finally {
+        _solveSourceOCV = prevOcvFrame;
       }
-      scenarioStateSourceVoltages.set(`${scenario}:${state.id}`, sv);
     }
   }
 
@@ -1801,33 +1988,40 @@ export function analyzeTree(
         const sv = scenarioStateSourceVoltages.get(`${sts.scenario}:${state.id}`)
           ?? scenarioOCVMaps.get(sts.scenario)!;
         const ocvMap = scenarioOCVMaps.get(sts.scenario)!;
-        let stateTimes = buildUnifiedTimeline(snm);
-        if (stateTimes.length > maxStateTimelinePoints) {
-          stateTimes = subsampleTimelinePoints(stateTimes, maxStateTimelinePoints);
-        }
-        const pts: TimeSeriesPoint[] = [];
-        for (let ti = 0; ti < stateTimes.length; ti++) {
-          let inputPower = 0;
-          let inputCurrent = 0;
-          let totalLoad = 0;
-          for (const s of sources) {
-            const sd = s.data as unknown as PowerSourceData;
-            if (sd.type !== 'source') continue;
-            const ocv = ocvMap.get(s.id) ?? sd.nominalVoltage;
-            const cur = getNodeCurrentDraw(s.id, snm, edges, ti, stateTimes, sv, state.auxLoadOverrides);
-            inputPower += cur * ocv;
-            inputCurrent += cur;
+        const prevOcvFrame = _solveSourceOCV;
+        _solveSourceOCV = ocvMap;
+        try {
+          let stateTimes = buildUnifiedTimeline(snm);
+          if (stateTimes.length > maxStateTimelinePoints) {
+            stateTimes = subsampleTimelinePoints(stateTimes, maxStateTimelinePoints);
           }
-          snm.forEach((node, nid) => {
-            const d = node.data as unknown as PowerNodeData;
-            if (d.type === 'load') {
-              const loadV = resolveInputVoltage(nid, snm, edges, sv);
-              totalLoad += getLoadCurrent(d as LoadData, stateTimes[ti], loadV) * loadV;
+          const pts: TimeSeriesPoint[] = [];
+          for (let ti = 0; ti < stateTimes.length; ti++) {
+            let inputPower = 0;
+            let inputCurrent = 0;
+            let totalLoad = 0;
+            for (const s of sources) {
+              const sd = s.data as unknown as PowerSourceData;
+              if (sd.type !== 'source') continue;
+              const ocv = ocvMap.get(s.id) ?? sd.nominalVoltage;
+              const cur = getNodeCurrentDraw(s.id, snm, edges, ti, stateTimes, sv, state.auxLoadOverrides);
+              inputPower += cur * ocv;
+              inputCurrent += cur;
             }
-          });
-          pts.push({ time: roundTime(stateTimes[ti]), inputPower, inputCurrent, totalLoad });
+            snm.forEach((node, nid) => {
+              const d = node.data as unknown as PowerNodeData;
+              if (d.type === 'load') {
+                const cur = getNodeCurrentDraw(nid, snm, edges, ti, stateTimes, sv, state.auxLoadOverrides);
+                const vTerm = resolveInputVoltageWithSeriesDrop(nid, snm, edges, sv, ti, stateTimes, state.auxLoadOverrides);
+                totalLoad += cur * vTerm;
+              }
+            });
+            pts.push({ time: roundTime(stateTimes[ti]), inputPower, inputCurrent, totalLoad });
+          }
+          statePoints[state.id] = pts;
+        } finally {
+          _solveSourceOCV = prevOcvFrame;
         }
-        statePoints[state.id] = pts;
       }
       sts.statePoints = statePoints;
     }
@@ -1936,24 +2130,30 @@ export function analyzeTree(
     const scenarioStateResults: Partial<Record<VoltageScenario, Record<string, StateResult>>> = {};
     const allScenarios: Partial<Record<VoltageScenario, ScenarioResult>> = {};
     for (const scenario of scenarios) {
-      const scStateRes: Record<string, StateResult> = {};
-      let wIn = 0, wOut = 0;
-      for (const state of states) {
-        const snm = stateNodeMaps.get(state.id)!;
-        const nodeData = snm.get(n.id)?.data as unknown as PowerNodeData ?? d;
-        const sv = scenarioStateSourceVoltages.get(`${scenario}:${state.id}`) ?? scenarioOCVMaps.get(scenario)!;
-        const sr = computeNodeStateResult(n.id, nodeData, snm, edges, times, sv, state.auxLoadOverrides);
-        scStateRes[state.id] = sr;
-        wIn += sr.inputPower * state.fractionOfTime;
-        wOut += sr.outputPower * state.fractionOfTime;
+      const prevOcvFrame = _solveSourceOCV;
+      _solveSourceOCV = scenarioOCVMaps.get(scenario)!;
+      try {
+        const scStateRes: Record<string, StateResult> = {};
+        let wIn = 0, wOut = 0;
+        for (const state of states) {
+          const snm = stateNodeMaps.get(state.id)!;
+          const nodeData = snm.get(n.id)?.data as unknown as PowerNodeData ?? d;
+          const sv = scenarioStateSourceVoltages.get(`${scenario}:${state.id}`) ?? scenarioOCVMaps.get(scenario)!;
+          const sr = computeNodeStateResult(n.id, nodeData, snm, edges, times, sv, state.auxLoadOverrides);
+          scStateRes[state.id] = sr;
+          wIn += sr.inputPower * state.fractionOfTime;
+          wOut += sr.outputPower * state.fractionOfTime;
+        }
+        scenarioStateResults[scenario] = scStateRes;
+        allScenarios[scenario] = {
+          inputPowerAvg: wIn,
+          outputPowerAvg: wOut,
+          powerLossAvg: Math.max(0, wIn - wOut),
+          efficiencyAvg: wIn > 0 ? wOut / wIn : 1,
+        };
+      } finally {
+        _solveSourceOCV = prevOcvFrame;
       }
-      scenarioStateResults[scenario] = scStateRes;
-      allScenarios[scenario] = {
-        inputPowerAvg: wIn,
-        outputPowerAvg: wOut,
-        powerLossAvg: Math.max(0, wIn - wOut),
-        efficiencyAvg: wIn > 0 ? wOut / wIn : 1,
-      };
     }
 
     // Use nominal scenario for the default stateResults
@@ -2115,6 +2315,22 @@ export function analyzeTree(
 
           if (isNodeOffInState(n.id, snm)) continue;
 
+          const svForClamp = scenarioStateSourceVoltages.get(`${scenario}:${state.id}`) ?? scenarioOCVMaps.get(scenario)!;
+          const ocvForDiag = scenarioOCVMaps.get(scenario)!;
+          if (d.type === 'load') {
+            const ldFull = snm.get(n.id)?.data as unknown as LoadData ?? (d as LoadData);
+            if (isLoadCappedByUpstreamSeriesR(n.id, ldFull, snm, edges, svForClamp, ocvForDiag)) {
+              diagnostics.push({
+                severity: 'warning',
+                nodeId: n.id,
+                nodeLabel: ldFull.label,
+                scenario: scenarios.length > 1 ? scenario : undefined,
+                stateId: states.length > 1 ? state.id : undefined,
+                message: `${loadUpstreamClampDiagnosticMessage(n.id, ldFull, snm, edges, svForClamp, ocvForDiag)}${scenarioLabel}${stateLabel}`,
+              });
+            }
+          }
+
           const parentId = parentMap.get(n.id);
           const parentSr = parentId ? resultMap.get(parentId)?.scenarioStateResults?.[scenario]?.[state.id] : undefined;
           const inputV = parentSr?.voltageOut ?? 0;
@@ -2207,9 +2423,9 @@ function accumulateNodePower(
   const children = getChildren(nodeId, edges);
 
   if (data.type === 'load') {
-    const loadV = resolveInputVoltage(nodeId, nodes, edges, sourceVoltages);
-    const cur = getLoadCurrent(data as LoadData, allTimes[timeIdx], loadV);
-    const power = cur * loadV;
+    const cur = getNodeCurrentDraw(nodeId, nodes, edges, timeIdx, allTimes, sourceVoltages, auxOverrides);
+    const vTerm = resolveInputVoltageWithSeriesDrop(nodeId, nodes, edges, sourceVoltages, timeIdx, allTimes, auxOverrides);
+    const power = cur * vTerm;
     acc.inputPower += power * dt;
     acc.outputPower += power * dt;
     return;

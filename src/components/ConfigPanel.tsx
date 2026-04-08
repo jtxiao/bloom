@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react';
+import { useState, useEffect, useRef, useCallback, type ChangeEvent, type KeyboardEvent } from 'react';
 import type { Node } from '@xyflow/react';
 import Papa from 'papaparse';
 import CsvImportWorker from '../workers/csvImportWorker?worker';
@@ -125,6 +125,21 @@ function compressLoadProfile(sorted: LoadProfilePoint[]): LoadProfilePoint[] {
 
 function allowSIInput(raw: string): boolean {
   return raw === '' || raw === '-' || /^-?\d*\.?\d*\s*[pnuµmkKMG]?$/.test(raw);
+}
+
+/** Enter in a field should push edits to the graph; exclude controls where Enter has another meaning. */
+function shouldFlushConfigOnEnter(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.closest('button')) return false;
+  if (target.isContentEditable) return false;
+  if (target.tagName === 'TEXTAREA') return false;
+  if (target.tagName === 'SELECT') return true;
+  if (target.tagName === 'INPUT') {
+    const t = (target as HTMLInputElement).type;
+    if (t === 'button' || t === 'submit' || t === 'reset' || t === 'checkbox' || t === 'radio' || t === 'file' || t === 'color') return false;
+    return true;
+  }
+  return false;
 }
 
 interface NumInputProps {
@@ -334,6 +349,27 @@ export default function ConfigPanel({ node, onUpdate, onClose, onDelete, upstrea
     onClose();
   };
 
+  const flushLocalToGraphAfterFieldCommit = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!dirtyRef.current) return;
+        onUpdate(node.id, localRef.current);
+        dirtyRef.current = false;
+      });
+    });
+  }, [node.id, onUpdate]);
+
+  const onConfigBodyKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLDivElement>) => {
+      if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
+      if (!shouldFlushConfigOnEnter(e.target)) return;
+      e.preventDefault();
+      (e.target as HTMLElement).blur();
+      flushLocalToGraphAfterFieldCommit();
+    },
+    [flushLocalToGraphAfterFieldCommit],
+  );
+
   const data = localData;
   const hasAux = data.type === 'source' || data.type === 'converter' || data.type === 'series';
 
@@ -343,7 +379,7 @@ export default function ConfigPanel({ node, onUpdate, onClose, onDelete, upstrea
         <h3>Configure {data.type}</h3>
         <button className="close-btn" onClick={handleClose}>X</button>
       </div>
-      <div className="config-body">
+      <div className="config-body" onKeyDown={onConfigBodyKeyDown}>
         {data.type === 'source' && (
           <SourceConfig data={data} onChange={setLocalDataTracked} />
         )}
