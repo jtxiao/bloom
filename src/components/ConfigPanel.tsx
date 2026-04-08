@@ -315,18 +315,11 @@ export default function ConfigPanel({ node, onUpdate, onClose, onDelete, upstrea
   const localRef = useRef(localData);
   localRef.current = localData;
 
-  // Sync when the underlying node changes (e.g. switching selected node)
   const nodeIdRef = useRef(node.id);
-  useEffect(() => {
-    if (node.id !== nodeIdRef.current) {
-      nodeIdRef.current = node.id;
-      setLocalData(incoming);
-      dirtyRef.current = false;
-    }
-  }, [node.id, incoming]);
-
-  // Track whether user made local edits
   const dirtyRef = useRef(false);
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
+
   const originalSetLocalData = setLocalData;
   const setLocalDataTracked = useCallback((d: PowerNodeData | ((prev: PowerNodeData) => PowerNodeData)) => {
     dirtyRef.current = true;
@@ -334,8 +327,6 @@ export default function ConfigPanel({ node, onUpdate, onClose, onDelete, upstrea
   }, [originalSetLocalData]);
 
   // Flush local edits to the real node data on unmount / close, but only if changed
-  const onUpdateRef = useRef(onUpdate);
-  onUpdateRef.current = onUpdate;
   useEffect(() => () => {
     if (dirtyRef.current) {
       onUpdateRef.current(nodeIdRef.current, localRef.current);

@@ -1,4 +1,5 @@
 import { useCallback, useState, useRef, useEffect, useMemo, DragEvent } from 'react';
+import { flushSync } from 'react-dom';
 import {
   ReactFlow,
   Controls,
@@ -718,16 +719,26 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     [screenToFlowPosition, setNodes, setPowerStates]
   );
 
+  /** Blur focused fields inside the config panel so pending values (e.g. NumInput) commit before changing selection. */
+  const flushPendingConfigInput = useCallback(() => {
+    flushSync(() => {
+      const panel = document.querySelector('.config-panel');
+      const ae = document.activeElement;
+      if (panel && ae instanceof HTMLElement && panel.contains(ae)) ae.blur();
+    });
+  }, []);
+
   const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (node.type === 'groupNode') return;
     const w = node.measured?.width ?? node.width ?? 150;
     const h = node.measured?.height ?? node.height ?? 80;
     setCenter(node.position.x + w / 2, node.position.y + h / 2, { zoom: getZoom(), duration: 200 });
     requestAnimationFrame(() => {
+      flushPendingConfigInput();
       setShowResults(false);
       setSelectedNode(node);
     });
-  }, [setCenter, getZoom]);
+  }, [setCenter, getZoom, flushPendingConfigInput]);
 
   const onNodeContextMenu = useCallback((e: React.MouseEvent, node: Node) => {
     if (node.type === 'groupNode' || node.type === 'textNode') return;
@@ -2174,6 +2185,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           onNodeClick={(nodeId) => {
             const node = nodes.find(n => n.id === nodeId);
             if (node) {
+              flushPendingConfigInput();
               setSelectedNode(node);
               fitView({ nodes: [{ id: nodeId }], duration: 400, padding: 0.3 });
             }
@@ -2188,6 +2200,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             onSelect={(nodeId) => {
               const node = nodes.find(n => n.id === nodeId);
               if (node) {
+                flushPendingConfigInput();
                 setSelectedNode(node);
                 fitView({ nodes: [{ id: nodeId }], duration: 400, padding: 0.3 });
               }
@@ -2256,6 +2269,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
       {selectedNode && selectedNode.type !== 'textNode' && (
         <ConfigPanel
+          key={selectedNode.id}
           node={selectedNode}
           onUpdate={updateNodeData}
           onClose={closeConfigPanel}
