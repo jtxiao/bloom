@@ -1697,6 +1697,17 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     setTimeout(() => setSaveToast(false), 1500);
   }, []);
 
+  const [loadErrorToast, setLoadErrorToast] = useState<string | null>(null);
+  const loadErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showLoadError = useCallback((message: string) => {
+    if (loadErrorTimer.current) clearTimeout(loadErrorTimer.current);
+    setLoadErrorToast(message);
+    loadErrorTimer.current = setTimeout(() => {
+      setLoadErrorToast(null);
+      loadErrorTimer.current = null;
+    }, 5500);
+  }, []);
+
   const saveProject = useCallback(async () => {
     const json = buildProjectJson();
     if (fileHandleRef.current) {
@@ -1747,9 +1758,24 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
   onTextNodeChangeRef.current = onTextNodeChange;
 
   const loadProjectFromJson = useCallback((json: string) => {
+    let project: Record<string, unknown>;
     try {
-      const project = JSON.parse(json);
-      const loadedNodes: Node[] = project.nodes.map((n: { id: string; type: string; position: { x: number; y: number }; data: Record<string, unknown>; style?: Record<string, unknown>; zIndex?: number; width?: number; height?: number }) => {
+      const parsed: unknown = JSON.parse(json);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        showLoadError('This file is not a valid project (expected a JSON object).');
+        return;
+      }
+      project = parsed as Record<string, unknown>;
+      if (!Array.isArray(project.nodes) || !Array.isArray(project.edges)) {
+        showLoadError('Invalid project file: it must include nodes and edges arrays.');
+        return;
+      }
+    } catch {
+      showLoadError('Invalid JSON — fix commas, brackets, or quotes, then try again.');
+      return;
+    }
+    try {
+      const loadedNodes: Node[] = project.nodes!.map((n: { id: string; type: string; position: { x: number; y: number }; data: Record<string, unknown>; style?: Record<string, unknown>; zIndex?: number; width?: number; height?: number }) => {
         const nodeData = { ...n.data };
         if (n.type === 'textNode') {
           const nId = n.id;
@@ -1764,7 +1790,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           ...(n.type === 'textNode' ? { zIndex: 10 } : {}),
         };
       });
-      const loadedEdges: Edge[] = project.edges.map((ed: { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }) => ({
+      const loadedEdges: Edge[] = project.edges!.map((ed: { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }) => ({
         id: ed.id,
         source: ed.source,
         target: ed.target,
@@ -1777,8 +1803,8 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
       // Apply the first power state's snapshots and overrides to the loaded nodes
       let resolvedNodes = loadedNodes;
-      if (project.powerStates && Array.isArray(project.powerStates) && project.powerStates.length > 0) {
-        const firstState = project.powerStates[0] as PowerState;
+      if (project.powerStates && Array.isArray(project.powerStates) && (project.powerStates as PowerState[]).length > 0) {
+        const firstState = (project.powerStates as PowerState[])[0];
         resolvedNodes = loadedNodes.map((n: Node) => {
           const d = n.data as Record<string, unknown>;
           const nodeType = (d as unknown as PowerNodeData).type;
@@ -1802,25 +1828,26 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       setSelectedNode(null);
       setShowResults(false);
 
-      if (project.projectName) setProjectName(project.projectName);
+      if (typeof project.projectName === 'string' && project.projectName) setProjectName(project.projectName);
       if (Array.isArray(project.notes)) {
-        onSetProjectNotes(project.notes.map((b: NoteBullet) => {
+        onSetProjectNotes((project.notes as NoteBullet[]).map((b: NoteBullet) => {
           if (b.nodeId && !b.nodeIds) return { ...b, nodeIds: [b.nodeId] };
           return b;
         }));
       } else if (typeof project.notes === 'string' && project.notes.trim()) {
-        onSetProjectNotes(project.notes.split('\n').filter((l: string) => l.trim()).map((l: string) => ({ id: crypto.randomUUID(), text: l.trim() })));
+        onSetProjectNotes((project.notes as string).split('\n').filter((l: string) => l.trim()).map((l: string) => ({ id: crypto.randomUUID(), text: l.trim() })));
       } else {
         onSetProjectNotes([]);
       }
-      if (project.theme) onSetTheme(project.theme);
-      if (project.activeScenario) setActiveScenario(project.activeScenario);
+      if (project.theme === 'dark' || project.theme === 'light') onSetTheme(project.theme);
+      if (typeof project.activeScenario === 'string') setActiveScenario(project.activeScenario);
 
       if (project.powerStates && Array.isArray(project.powerStates)) {
-        setPowerStates(project.powerStates);
-        if (project.powerStates.length > 0) {
-          setActiveStateId(project.powerStates[0].id);
-          activeStateIdRef.current = project.powerStates[0].id;
+        const states = project.powerStates as PowerState[];
+        setPowerStates(states);
+        if (states.length > 0) {
+          setActiveStateId(states[0].id);
+          activeStateIdRef.current = states[0].id;
         }
       }
 
@@ -1831,9 +1858,9 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
       _edgesFpCache = { ref: null, fp: '' };
       _statesFpCache = { ref: null, fp: '' };
     } catch {
-      alert('Invalid project file.');
+      showLoadError('Could not read node or edge data — the file may be corrupted or from an incompatible version.');
     }
-  }, [setNodes, setEdges, theme, onSetTheme, setPowerStates]);
+  }, [setNodes, setEdges, theme, onSetTheme, onSetProjectNotes, setPowerStates, showLoadError]);
 
   const didAutoLoad = useRef(false);
   useEffect(() => {
@@ -1857,7 +1884,11 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         const file = await handle.getFile();
         const text = await file.text();
         loadProjectFromJson(text);
-      } catch { /* user cancelled */ }
+      } catch (e) {
+        const name = e && typeof e === 'object' && 'name' in e ? String((e as { name: string }).name) : '';
+        if (name === 'AbortError') return;
+        showLoadError('Could not read the selected file.');
+      }
     } else {
       const input = document.createElement('input');
       input.type = 'file';
@@ -1867,11 +1898,12 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
         if (!file) return;
         const reader = new FileReader();
         reader.onload = () => loadProjectFromJson(reader.result as string);
+        reader.onerror = () => showLoadError('Could not read the selected file.');
         reader.readAsText(file);
       };
       input.click();
     }
-  }, [loadProjectFromJson]);
+  }, [loadProjectFromJson, showLoadError]);
 
   const loadProject = useCallback(() => {
     if (nodes.length > 0) {
@@ -2012,6 +2044,7 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
           </div>
         </div>
         {saveToast && <div className="save-toast">Saved</div>}
+        {loadErrorToast && <div className="load-error-toast" role="alert">{loadErrorToast}</div>}
         <div className="state-tabs-bar">
           {powerStates.map(s => (
             <Tooltip key={s.id} text={`Switch to ${s.name} (${(s.fractionOfTime * 100).toFixed(0)}% duty cycle). Each state can have different load values and enabled/disabled components.`}>

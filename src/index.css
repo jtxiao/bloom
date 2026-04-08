@@ -2016,6 +2016,34 @@ button.file-label:hover {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 
+.load-error-toast {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(420px, calc(100vw - 24px));
+  text-align: center;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid #c94c4c;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  z-index: 10000;
+  pointer-events: none;
+  animation: error-toast-fade 5.5s ease-in-out forwards;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+@keyframes error-toast-fade {
+  0% { opacity: 0; transform: translateX(-50%) translateY(-6px); }
+  6% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  88% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-4px); }
+}
+
 @keyframes toast-fade {
   0% { opacity: 0; transform: translateX(-50%) translateY(-6px); }
   15% { opacity: 1; transform: translateX(-50%) translateY(0); }
