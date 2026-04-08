@@ -1072,6 +1072,158 @@ function ConverterConfig({ data, onChange, upstreamAncestorsOff }: { data: Power
   );
 }
 
+const DEFAULT_PERIOD_MIN = 0.001;
+const DEFAULT_PERIOD_MAX = 10;
+const DEFAULT_PW_MAX = 0.01;
+
+function formatTimeCompact(s: number): string {
+  if (s >= 1) return `${s.toFixed(3)} s`;
+  if (s >= 1e-3) return `${(s * 1e3).toFixed(2)} ms`;
+  return `${(s * 1e6).toFixed(1)} µs`;
+}
+
+function SliderRangeInput({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
+  const [local, setLocal] = useState('');
+  const committed = useRef(value);
+  const active = useRef(false);
+
+  useEffect(() => {
+    if (!active.current) {
+      committed.current = value;
+      setLocal('');
+    }
+  }, [value]);
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      className="slider-bound-input"
+      placeholder={label}
+      value={active.current ? local : formatTimeCompact(value)}
+      onFocus={() => {
+        active.current = true;
+        setLocal(String(value));
+      }}
+      onChange={e => { if (allowSIInput(e.target.value)) setLocal(e.target.value); }}
+      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLElement).blur(); }}
+      onBlur={() => {
+        active.current = false;
+        const { value: n } = parseSI(local);
+        if (!isNaN(n) && n > 0) {
+          committed.current = n;
+          onChange(n);
+        }
+        setLocal('');
+      }}
+    />
+  );
+}
+
+function PulseDutyLoadFields({ data, onChange }: { data: LoadData; onChange: (d: LoadData) => void }) {
+  const [periodMin, setPeriodMin] = useState(DEFAULT_PERIOD_MIN);
+  const [periodMax, setPeriodMax] = useState(DEFAULT_PERIOD_MAX);
+  const [pwMin, setPwMin] = useState(0);
+  const [pwMax, setPwMax] = useState(DEFAULT_PW_MAX);
+
+  const T = Math.max(1e-9, data.pulsePeriodSeconds ?? 0.02);
+  const dutyFrac = Math.max(0, Math.min(1, data.pulseDutyCycle ?? 0.01));
+  const pulseWidth = dutyFrac * T;
+
+  const effPeriodMin = Math.max(1e-9, periodMin);
+  const effPeriodMax = Math.max(effPeriodMin + 1e-9, periodMax);
+  const effPwMin = Math.max(0, pwMin);
+  const effPwMax = Math.max(effPwMin + 1e-12, Math.min(pwMax, T));
+  const periodStep = Math.max(1e-6, (effPeriodMax - effPeriodMin) / 1000);
+  const pwStep = Math.max(1e-9, (effPwMax - effPwMin) / 1000);
+  const periodPct = effPeriodMax > effPeriodMin ? ((T - effPeriodMin) / (effPeriodMax - effPeriodMin)) * 100 : 50;
+  const pwPct = effPwMax > effPwMin ? ((Math.min(pulseWidth, effPwMax) - effPwMin) / (effPwMax - effPwMin)) * 100 : 50;
+
+  return (
+    <div className="pulse-duty-fields">
+      <p className="upload-hint" style={{ marginBottom: 10 }}>
+        Repeating pattern: pulse current at the start of each interval, then baseline. Use for periodic radio bursts (e.g. BLE advertising).
+      </p>
+      <label>
+        Baseline current (A)
+        <NumInput value={data.pulseBaselineCurrent ?? 0} onChange={v => onChange({ ...data, pulseBaselineCurrent: v })} />
+      </label>
+      <label>
+        Pulse / active current (A)
+        <NumInput value={data.pulsePeakCurrent ?? 0} onChange={v => onChange({ ...data, pulsePeakCurrent: v })} />
+      </label>
+      <label className="config-slider-field">
+        <span className="config-slider-label">Interval (period)</span>
+        <div className="slider-bounds-row">
+          <SliderRangeInput label="min" value={periodMin} onChange={v => setPeriodMin(Math.max(1e-9, v))} />
+          <span className="slider-bounds-sep">–</span>
+          <SliderRangeInput label="max" value={periodMax} onChange={v => setPeriodMax(Math.max(periodMin + 1e-9, v))} />
+        </div>
+        <div className="config-slider-row">
+          <input
+            type="range"
+            className="config-interval-slider"
+            min={effPeriodMin}
+            max={effPeriodMax}
+            step={periodStep}
+            value={Math.max(effPeriodMin, Math.min(effPeriodMax, T))}
+            style={{ '--range-pct': `${Math.max(0, Math.min(100, periodPct))}%` } as React.CSSProperties}
+            onChange={e => {
+              const newT = Math.max(effPeriodMin, Math.min(effPeriodMax, parseFloat(e.target.value)));
+              const pw = (data.pulseDutyCycle ?? 0.01) * T;
+              onChange({ ...data, pulsePeriodSeconds: newT, pulseDutyCycle: Math.min(pw / newT, 1) });
+            }}
+          />
+          <NumInput
+            value={T}
+            onChange={v => {
+              const newT = Math.max(1e-9, v);
+              const pw = (data.pulseDutyCycle ?? 0.01) * T;
+              onChange({ ...data, pulsePeriodSeconds: newT, pulseDutyCycle: Math.min(pw / newT, 1) });
+            }}
+          />
+        </div>
+        <span className="upload-hint">
+          {formatTimeCompact(T)} per cycle
+        </span>
+      </label>
+      <label className="config-slider-field">
+        <span className="config-slider-label">Pulse width</span>
+        <div className="slider-bounds-row">
+          <SliderRangeInput label="min" value={pwMin} onChange={v => setPwMin(Math.max(0, v))} />
+          <span className="slider-bounds-sep">–</span>
+          <SliderRangeInput label="max" value={pwMax} onChange={v => setPwMax(Math.max(pwMin + 1e-12, v))} />
+        </div>
+        <div className="config-slider-row">
+          <input
+            type="range"
+            className="config-interval-slider"
+            min={effPwMin}
+            max={effPwMax}
+            step={pwStep}
+            value={Math.max(effPwMin, Math.min(effPwMax, pulseWidth))}
+            style={{ '--range-pct': `${Math.max(0, Math.min(100, pwPct))}%` } as React.CSSProperties}
+            onChange={e => {
+              const pw = parseFloat(e.target.value);
+              onChange({ ...data, pulseDutyCycle: Math.max(0, Math.min(1, pw / T)) });
+            }}
+          />
+          <NumInput
+            value={pulseWidth}
+            onChange={v => {
+              const pw = Math.max(0, Math.min(T, v));
+              onChange({ ...data, pulseDutyCycle: pw / T });
+            }}
+          />
+        </div>
+        <span className="upload-hint">
+          {formatTimeCompact(pulseWidth)} active ({(dutyFrac * 100).toFixed(dutyFrac < 0.01 ? 2 : 1)}% duty cycle)
+        </span>
+      </label>
+    </div>
+  );
+}
+
 function LoadConfig({ data, onChange, upstreamAncestorsOff }: { data: LoadData; onChange: (d: LoadData) => void; upstreamAncestorsOff?: boolean }) {
   const [newTime, setNewTime] = useState('');
   const [newCurrent, setNewCurrent] = useState('');
@@ -1168,9 +1320,24 @@ function LoadConfig({ data, onChange, upstreamAncestorsOff }: { data: LoadData; 
       <label>
         Load Mode
         <select value={data.loadMode || 'current_profile'}
-          onChange={e => onChange({ ...data, loadMode: e.target.value as 'current_profile' | 'resistor' | 'fixed_current' })}>
+          onChange={e => {
+            const v = e.target.value as LoadData['loadMode'];
+            if (v === 'pulse_duty') {
+              onChange({
+                ...data,
+                loadMode: v,
+                pulseBaselineCurrent: data.pulseBaselineCurrent ?? 5e-6,
+                pulsePeakCurrent: data.pulsePeakCurrent ?? 0.015,
+                pulsePeriodSeconds: data.pulsePeriodSeconds ?? 0.02,
+                pulseDutyCycle: data.pulseDutyCycle ?? 0.01,
+              });
+            } else {
+              onChange({ ...data, loadMode: v });
+            }
+          }}>
           <option value="fixed_current">Fixed Current</option>
           <option value="current_profile">Current Profile (vs Time)</option>
+          <option value="pulse_duty">Pulse Duty (e.g. BLE advertising)</option>
           <option value="resistor">Resistor (constant R)</option>
         </select>
       </label>
@@ -1185,6 +1352,8 @@ function LoadConfig({ data, onChange, upstreamAncestorsOff }: { data: LoadData; 
           Current (A)
           <NumInput value={data.fixedCurrent || 0} onChange={v => onChange({ ...data, fixedCurrent: v })} />
         </label>
+      ) : data.loadMode === 'pulse_duty' ? (
+        <PulseDutyLoadFields data={data} onChange={onChange} />
       ) : (() => {
         const sortedIdx = data.loadProfile
           .map((p, origIdx) => ({ p, origIdx }))

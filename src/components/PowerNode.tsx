@@ -279,13 +279,15 @@ function PowerNode({ data }: { data: Record<string, unknown> }) {
         : `${ld.resistance.toFixed(1)} ohm`;
     } else if (ld.loadMode === 'fixed_current' || !ld.loadMode) {
       detail = (ld.fixedCurrent || 0) > 0 ? formatCurrent(ld.fixedCurrent || 0) : '--';
+    } else if (ld.loadMode === 'pulse_duty') {
+      detail = displayCurrent > 0 ? `Avg ${formatCurrent(displayCurrent)}` : '--';
     } else {
       detail = displayCurrent > 0 ? `Avg: ${formatCurrent(displayCurrent)}` : '--';
     }
     return (
       <div className={`power-node load-node ${isDisabled || !railActive ? 'node-disabled' : ''}`} style={heatStyle}>
         <div className="node-header load">
-          {ld.loadMode === 'resistor' ? 'RESISTOR' : 'LOAD'}
+          {ld.loadMode === 'resistor' ? 'RESISTOR' : ld.loadMode === 'pulse_duty' ? 'PULSE' : 'LOAD'}
           {!userOn && <span className="node-off-badge">OFF</span>}
         </div>
         <div className="node-body">

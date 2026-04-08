@@ -299,9 +299,11 @@ function loadBranchCurrentAtTime(
   }
   const iWant = mode === 'fixed_current'
     ? (ld.fixedCurrent || 0)
-    : (profileCurrentOverride != null
-      ? profileCurrentOverride
-      : getCurrentAtTime(ld.loadProfile || [], t));
+    : mode === 'pulse_duty'
+      ? (profileCurrentOverride != null ? profileCurrentOverride : getPulseDutyCurrent(ld, t))
+      : (profileCurrentOverride != null
+        ? profileCurrentOverride
+        : getCurrentAtTime(ld.loadProfile || [], t));
   if (rPath > 0) return Math.min(iWant, vTh / rPath);
   return iWant;
 }
@@ -340,6 +342,11 @@ function isLoadCappedByUpstreamSeriesR(
   if (mode === 'fixed_current') {
     return (ld.fixedCurrent || 0) > iMax + LOAD_UPSTREAM_CLAMP_EPS;
   }
+  if (mode === 'pulse_duty') {
+    const ip = ld.pulsePeakCurrent || 0;
+    const ib = ld.pulseBaselineCurrent || 0;
+    return Math.max(ip, ib) > iMax + LOAD_UPSTREAM_CLAMP_EPS;
+  }
   for (const p of ld.loadProfile || []) {
     if (p.current > iMax + LOAD_UPSTREAM_CLAMP_EPS) return true;
   }
@@ -364,6 +371,11 @@ function loadUpstreamClampDiagnosticMessage(
   if (mode === 'fixed_current') {
     const iw = ld.fixedCurrent || 0;
     return `Load "${ld.label}" requests ${formatAmperesForDiag(iw)} but upstream resistive path (~${rStr}) with ~${vStr}V open-circuit (before I·R drops) allows at most ${imStr} before the rail reaches 0V; analysis uses the capped current.`;
+  }
+  if (mode === 'pulse_duty') {
+    const ip = ld.pulsePeakCurrent || 0;
+    const ib = ld.pulseBaselineCurrent || 0;
+    return `Load "${ld.label}" pulse duty requests up to ${formatAmperesForDiag(Math.max(ip, ib))} but upstream resistive path (~${rStr}) with ~${vStr}V open-circuit allows at most ${imStr}; analysis uses the capped current.`;
   }
   return `Load "${ld.label}" current profile exceeds ${imStr} in at least one segment; upstream resistive path ~${rStr} with ~${vStr}V open-circuit (before I·R drops) would collapse the rail without limiting; analysis uses the capped current.`;
 }
@@ -627,6 +639,34 @@ function getCurrentAtTime(profile: LoadProfilePoint[], time: number): number {
   return sorted[lo].current;
 }
 
+/** Rectangular wave: peak current for [0, duty×T), baseline for [duty×T, T). */
+function getPulseDutyCurrent(ld: LoadData, time: number): number {
+  const T = ld.pulsePeriodSeconds ?? 0;
+  if (!(T > 0)) return ld.pulseBaselineCurrent ?? 0;
+  const dc = Math.max(0, Math.min(1, ld.pulseDutyCycle ?? 0.05));
+  const pw = dc * T;
+  const ip = ld.pulsePeakCurrent ?? 0;
+  const ib = ld.pulseBaselineCurrent ?? 0;
+  if (pw <= 0) return ib;
+  if (pw >= T) return ip;
+  const phase = time % T;
+  return phase < pw ? ip : ib;
+}
+
+/** Step profile equivalent to pulse_duty for shared timeline / fast state integration. */
+function pulseDutySyntheticProfile(ld: LoadData): LoadProfilePoint[] | null {
+  if (ld.loadMode !== 'pulse_duty') return null;
+  const T = ld.pulsePeriodSeconds ?? 0;
+  if (!(T > 0)) return null;
+  const dc = Math.max(0, Math.min(1, ld.pulseDutyCycle ?? 0.05));
+  const w = dc * T;
+  const ip = ld.pulsePeakCurrent ?? 0;
+  const ib = ld.pulseBaselineCurrent ?? 0;
+  if (w <= 0) return [{ time: 0, current: ib }, { time: T, current: ib }];
+  if (w >= T) return [{ time: 0, current: ip }, { time: T, current: ip }];
+  return [{ time: 0, current: ip }, { time: w, current: ib }, { time: T, current: ib }];
+}
+
 /** Largest index with times[i] <= t (for mapping profile time to unified timeline voltage). */
 function timeIndexAtOrBefore(times: number[], t: number): number {
   if (times.length === 0) return 0;
@@ -831,6 +871,20 @@ function buildUnifiedTimeline(
 
   const addLoadProfile = (ld: LoadData, key: string) => {
     if (seen.has(key)) return;
+    if (ld.loadMode === 'pulse_duty') {
+      const T = ld.pulsePeriodSeconds || 0;
+      const ip = ld.pulsePeakCurrent ?? 0;
+      const ib = ld.pulseBaselineCurrent ?? 0;
+      if (T > 0 && Math.abs(ip - ib) > 1e-15) {
+        const dc = Math.max(0, Math.min(1, ld.pulseDutyCycle ?? 0.05));
+        const w = dc * T;
+        const pts = w <= 0 || w >= T ? [0, T] : [0, w, T];
+        const uniq = [...new Set(pts)].sort((a, b) => a - b);
+        seen.add(key);
+        loadPeriods.push({ period: T, points: uniq });
+      }
+      return;
+    }
     if (ld.loadMode === 'current_profile' && ld.loadProfile.length > 1) {
       let sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
 
@@ -1309,7 +1363,14 @@ function accumulateDischargeStep(
 }
 
 function loadHasTimeVaryingCurrentProfile(ld: LoadData | undefined): boolean {
-  if (!ld || ld.loadMode !== 'current_profile' || !ld.loadProfile || ld.loadProfile.length <= 1) return false;
+  if (!ld) return false;
+  if (ld.loadMode === 'pulse_duty') {
+    const T = ld.pulsePeriodSeconds ?? 0;
+    const ip = ld.pulsePeakCurrent ?? 0;
+    const ib = ld.pulseBaselineCurrent ?? 0;
+    return T > 0 && Math.abs(ip - ib) > 1e-12;
+  }
+  if (ld.loadMode !== 'current_profile' || !ld.loadProfile || ld.loadProfile.length <= 1) return false;
   const sorted = [...ld.loadProfile].sort((a, b) => a.time - b.time);
   if (!(sorted[sorted.length - 1].time > 0)) return false;
   const i0 = sorted[0].current;
@@ -1654,6 +1715,14 @@ function computeNodeStateResult(
         inputPower: 0, outputPower: 0, powerLoss: 0, efficiency: 1,
         voltageOut: 0, currentOut: 0, currentRms: 0, peakCurrent: 0, peakInputPower: 0, auxPower: 0,
       };
+    }
+    if (ld.loadMode === 'pulse_duty') {
+      const syn = pulseDutySyntheticProfile(ld);
+      if (syn && syn.length > 1) {
+        const ldAsProfile: LoadData = { ...ld, loadMode: 'current_profile', loadProfile: syn };
+        const fast = stateResultFromCurrentProfile(nodeId, ldAsProfile, stateNodeMap, edges, times, sourceVoltages, auxOverrides);
+        if (fast) return fast;
+      }
     }
     if (ld.loadMode === 'current_profile' && (ld.loadProfile?.length ?? 0) > 1) {
       const fast = stateResultFromCurrentProfile(nodeId, ld, stateNodeMap, edges, times, sourceVoltages, auxOverrides);

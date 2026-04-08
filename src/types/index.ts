@@ -7,7 +7,7 @@ export interface NoteBullet {
   nodeIds?: string[];
 }
 export type ConverterType = 'switching' | 'ldo';
-export type LoadMode = 'current_profile' | 'resistor' | 'fixed_current';
+export type LoadMode = 'current_profile' | 'resistor' | 'fixed_current' | 'pulse_duty';
 export type SeriesMode = 'resistor' | 'diode';
 export type SourceMode = 'fixed' | 'battery';
 export type BatteryMode = 'simple' | 'detailed';
@@ -110,6 +110,14 @@ export interface LoadData {
   resistance: number;
   fixedCurrent: number;
   enabled: boolean;
+  /** Pulse duty mode: sleep / baseline current (A). */
+  pulseBaselineCurrent?: number;
+  /** Pulse duty mode: active / advertising current (A). */
+  pulsePeakCurrent?: number;
+  /** Pulse duty mode: full period (s); waveform repeats. */
+  pulsePeriodSeconds?: number;
+  /** Pulse duty mode: fraction of period at peak current (0–1). */
+  pulseDutyCycle?: number;
 }
 
 export interface SeriesElementData {
