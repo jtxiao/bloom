@@ -732,6 +732,8 @@ function buildSheet(
   ws.views = [{ state: 'frozen', ySplit: headerRow.number }];
   // Aux detail rows are grouped above their summary (the node row) and collapsed.
   ws.properties.outlineProperties = { summaryBelow: false, summaryRight: false };
+
+  return { totalRow: tr, rowOf };
 }
 
 /** Build the live η lookup formula (without leading '=') for a converter's output-current cell. */
@@ -903,13 +905,17 @@ interface BatteryEntry {
   bloomLifeHours?: number;
 }
 
-function buildBatteryTab(workbook: ExcelJS.Workbook, entries: BatteryEntry[]) {
-  if (entries.length === 0) return;
-  const ws = workbook.addWorksheet('Battery Life');
+const BATTERY_SHEET = 'Battery Life';
+
+/** Returns the worksheet row of the first battery entry (for cross-sheet references), or 0. */
+function buildBatteryTab(workbook: ExcelJS.Workbook, entries: BatteryEntry[]): number {
+  if (entries.length === 0) return 0;
+  const ws = workbook.addWorksheet(BATTERY_SHEET);
   ws.getCell('A1').value = 'Energy-based life: usable energy (Wh) \u00F7 average input power (W). Edit "Usable %" to model cutoff derating. "Bloom life" is the app\u2019s dynamic discharge result; tune Usable % until \u0394 \u2248 0.';
   ws.getCell('A1').font = { italic: true, color: { argb: 'FF888888' } };
   const hr = ws.addRow(['Battery', 'Capacity (mAh)', 'Nominal V', 'Usable %', 'Avg power (W)', 'Usable energy (Wh)', 'Est. life (h)', 'Est. life (days)', 'Bloom life (h)', '\u0394 Est vs Bloom']);
   styleHeaderRow(hr);
+  const firstDataRow = hr.number + 1;
   for (const e of entries) {
     const r = ws.addRow([e.label, e.capacityMah, e.nominalV, e.usableFrac, e.avgPowerW, null, null, null, e.bloomLifeHours ?? null, null]);
     const rn = r.number;
@@ -931,6 +937,131 @@ function buildBatteryTab(workbook: ExcelJS.Workbook, entries: BatteryEntry[]) {
   }
   ws.columns = [{ width: 26 }, { width: 14 }, { width: 11 }, { width: 10 }, { width: 14 }, { width: 18 }, { width: 13 }, { width: 15 }, { width: 14 }, { width: 14 }];
   ws.views = [{ state: 'frozen', ySplit: hr.number }];
+  return firstDataRow;
+}
+
+const TIME_UNITS: [string, number][] = [
+  ['ms', 0.001], ['s', 1], ['min', 60], ['hr', 3600],
+  ['day', 86400], ['week', 604800], ['month', 2629800],
+];
+const UNIT_LIST = TIME_UNITS.map(u => u[0]).join(',');
+
+interface FeatureTabOpts {
+  states: { name: string; sheet: string }[]; // feature = power state, with its budget sheet
+  pinCol: string;       // column letter of Pin on the budget sheets
+  batteryRow: number;   // row of the battery source on the budget sheets
+  energyRef: string;    // cell ref to usable energy (Wh) on the Battery Life tab
+}
+
+/**
+ * PM-facing "what-if" tab: each feature (power state) runs for a chosen
+ * duration every chosen period; battery life follows from the duty-weighted
+ * average power. Per-state power is pulled from the budget sheets (which match
+ * the engine per state), so this stays consistent with Bloom's model.
+ */
+function buildFeatureImpactTab(workbook: ExcelJS.Workbook, opts: FeatureTabOpts) {
+  const { states, pinCol, batteryRow, energyRef } = opts;
+  if (states.length === 0) return;
+  const ws = workbook.addWorksheet('Feature Impact');
+
+  ws.getCell('A1').value = 'Feature Impact on Battery Life';
+  ws.getCell('A1').font = { bold: true, size: 14 };
+  ws.getCell('A2').value = 'Set how long each feature runs and how often. Battery life updates automatically. Pick the idle (rest-of-time) state below. Calibrate "Usable %" on the Battery Life tab so this matches the app.';
+  ws.getCell('A2').font = { italic: true, color: { argb: 'FF888888' } };
+
+  // Units lookup table (off to the right).
+  ws.getCell('M1').value = 'unit';
+  ws.getCell('N1').value = 'seconds';
+  ws.getCell('M1').font = { bold: true };
+  ws.getCell('N1').font = { bold: true };
+  TIME_UNITS.forEach((u, i) => {
+    ws.getCell(2 + i, 13).value = u[0];
+    ws.getCell(2 + i, 14).value = u[1];
+  });
+  const unitsRange = `$M$2:$N$${1 + TIME_UNITS.length}`;
+
+  ws.getCell('A4').value = 'Idle (rest-of-time) state:';
+  ws.getCell('A4').font = { bold: true };
+  const idleCell = ws.getCell('C4');
+  // Default idle = last state (often the lowest-power "sleep").
+  idleCell.value = states[states.length - 1].name;
+  idleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3C4' } };
+
+  ws.getCell('A5').value = 'Usable energy (Wh):';
+  ws.getCell('A5').font = { bold: true };
+  ws.getCell('C5').value = { formula: energyRef };
+  ws.getCell('C5').numFmt = '0.000';
+
+  const headerRow = ws.addRow([]); // row 6 spacer is implicit; build header at row 7
+  void headerRow;
+  const hr = 7;
+  const headers = ['Feature (state)', 'Active for', 'unit', 'every', 'unit', 'On-time %', 'Time share', 'State power (W)', 'Avg power (W)'];
+  headers.forEach((h, i) => { ws.getCell(hr, 1 + i).value = h; });
+  ws.getRow(hr).font = { bold: true };
+  ws.getRow(hr).eachCell(c => {
+    c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F2430' } };
+    c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  });
+
+  const first = hr + 1;
+  states.forEach((st, i) => {
+    const rn = first + i;
+    ws.getCell(rn, 1).value = st.name;
+    // B active-for, C unit, D every, E unit are user inputs (defaults: idle blank).
+    const isIdleDefault = i === states.length - 1;
+    if (!isIdleDefault) {
+      ws.getCell(rn, 2).value = 0;     // active duration
+      ws.getCell(rn, 3).value = 's';
+      ws.getCell(rn, 4).value = 1;     // period
+      ws.getCell(rn, 5).value = 'day';
+    }
+    // unit dropdowns
+    for (const col of [3, 5]) {
+      ws.getCell(rn, col).dataValidation = { type: 'list', allowBlank: true, formulae: [`"${UNIT_LIST}"`] };
+    }
+    const B = `B${rn}`, C = `C${rn}`, D = `D${rn}`, E = `E${rn}`, F = `F${rn}`;
+    // On-time fraction = (dur*unit) / (period*unit)
+    ws.getCell(rn, 6).value = { formula: `IF(OR(${B}="",${D}="",${D}=0),"",(${B}*VLOOKUP(${C},${unitsRange},2,FALSE))/(${D}*VLOOKUP(${E},${unitsRange},2,FALSE)))` };
+    ws.getCell(rn, 6).numFmt = '0.000%';
+    // Time share: idle row gets the remainder; others get their on-time.
+    ws.getCell(rn, 7).value = { formula: `IF($C$4=A${rn},MAX(0,1-SUM($F$${first}:$F$${first + states.length - 1})),IF(${F}="",0,${F}))` };
+    ws.getCell(rn, 7).numFmt = '0.000%';
+    // State power pulled live from that state's budget sheet (battery source input).
+    ws.getCell(rn, 8).value = { formula: `'${st.sheet.replace(/'/g, "''")}'!${pinCol}${batteryRow}` };
+    ws.getCell(rn, 8).numFmt = '0.000000';
+    // Avg power contribution = time share * state power.
+    ws.getCell(rn, 9).value = { formula: `G${rn}*H${rn}` };
+    ws.getCell(rn, 9).numFmt = '0.000000';
+  });
+  const last = first + states.length - 1;
+
+  // Idle-state dropdown over the feature names.
+  idleCell.dataValidation = { type: 'list', allowBlank: false, formulae: [`$A$${first}:$A$${last}`] };
+
+  // Results block.
+  let rr = last + 2;
+  const setKV = (label: string, formula: string, fmt: string, big = false) => {
+    ws.getCell(rr, 1).value = label;
+    ws.getCell(rr, 1).font = { bold: true, size: big ? 12 : 11 };
+    const vc = ws.getCell(rr, 3);
+    vc.value = { formula };
+    vc.numFmt = fmt;
+    vc.font = { bold: true, size: big ? 12 : 11, color: big ? { argb: 'FF1B7F4B' } : undefined };
+    rr += 1;
+  };
+  const totalP = `SUM($I$${first}:$I$${last})`;
+  ws.getCell(rr, 1).value = 'Total time share (should be 100%):';
+  ws.getCell(rr, 1).font = { bold: true };
+  ws.getCell(rr, 3).value = { formula: `SUM($G$${first}:$G$${last})` };
+  ws.getCell(rr, 3).numFmt = '0.0%';
+  rr += 1;
+  setKV('Average power (W):', totalP, '0.000000');
+  setKV('Battery life (hours):', `IF(${totalP}=0,0,$C$5/(${totalP}))`, '0.0', true);
+  setKV('Battery life (days):', `IF(${totalP}=0,0,$C$5/(${totalP})/24)`, '0.00', true);
+  setKV('Battery life (weeks):', `IF(${totalP}=0,0,$C$5/(${totalP})/24/7)`, '0.00');
+  setKV('Battery life (months):', `IF(${totalP}=0,0,$C$5/(${totalP})/24/30.44)`, '0.00');
+
+  ws.columns = [{ width: 22 }, { width: 12 }, { width: 9 }, { width: 10 }, { width: 9 }, { width: 12 }, { width: 12 }, { width: 16 }, { width: 16 }, { width: 4 }, { width: 4 }, { width: 4 }, { width: 8 }, { width: 10 }];
 }
 
 export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<ExcelJS.Workbook> {
@@ -978,18 +1109,19 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
   const profileRef = buildProfilesTab(workbook, profileEntries);
   const ctx: SheetCtx = { dataMap, effRef, profileRef };
 
+  // Identical row layout across all budget sheets; capture it once for the
+  // Feature Impact tab to reference per-state cells.
+  let layout: { totalRow: number; rowOf: Map<string, number> } | null = null;
+  // Each entry: a feature (power state) and the budget sheet that holds its numbers.
+  let featureStates: { name: string; sheet: string }[] = [];
+
   if (multiState) {
-    // Sheet names must match what buildSheet uses (sliced to 31 chars) so the
-    // weighted Summary can reference each state sheet's cells by name.
     const stateSheets = states.map(st => ({
       st,
       sheet: (st.name || st.id).slice(0, 31),
       frac: st.fractionOfTime,
     }));
 
-    // Summary first (in tab order) — a true duty-weighted reference to the
-    // per-state sheets. Excel resolves the references by name regardless of
-    // creation order, and every sheet shares identical row layout.
     buildSheet(
       workbook,
       'Summary',
@@ -999,10 +1131,9 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
       { ...ctx, weighted: stateSheets.map(s => ({ sheet: s.sheet, frac: s.frac })) },
     );
 
-    // Per-state sheets (live model formulas).
     for (const { st, sheet } of stateSheets) {
       const pct = (st.fractionOfTime * 100).toFixed(0);
-      buildSheet(
+      layout = buildSheet(
         workbook,
         sheet,
         `Power state "${st.name}" (${pct}% duty) — ${scenarioLabel}`,
@@ -1011,8 +1142,9 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
         ctx,
       );
     }
+    featureStates = stateSheets.map(s => ({ name: s.st.name || s.st.id, sheet: s.sheet }));
   } else {
-    buildSheet(
+    layout = buildSheet(
       workbook,
       'Summary',
       `Power budget — ${scenarioLabel}`,
@@ -1020,16 +1152,17 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
       r => getWeightedMetrics(r, activeScenario),
       ctx,
     );
+    featureStates = [{ name: states[0]?.name || 'Operating', sheet: 'Summary' }];
   }
 
   // Battery life tab (after the budget sheets, before the reference tabs).
   const batteryEntries: BatteryEntry[] = [];
+  let firstBatteryId: string | null = null;
   for (const r of results) {
     if (r.type !== 'source') continue;
     const sd = dataMap.get(r.nodeId) as PowerSourceData | undefined;
     if (!sd || sd.sourceMode !== 'battery') continue;
-    // Default usable fraction: fraction of the nominal->cutoff window still
-    // available (rough cutoff derate); falls back to 100% when unknown.
+    if (!firstBatteryId) firstBatteryId = r.nodeId;
     let usableFrac = 1;
     const cutoff = sd.cutoffVoltage || 0;
     if (cutoff > 0 && sd.nominalVoltage > cutoff) {
@@ -1044,7 +1177,20 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
       bloomLifeHours: r.batteryLifetimeHours,
     });
   }
-  buildBatteryTab(workbook, batteryEntries);
+  const batteryFirstRow = buildBatteryTab(workbook, batteryEntries);
+
+  // PM-facing Feature Impact tab (only when there is a battery to deplete).
+  if (firstBatteryId && layout && batteryFirstRow > 0) {
+    const batteryRow = layout.rowOf.get(firstBatteryId);
+    if (batteryRow) {
+      buildFeatureImpactTab(workbook, {
+        states: featureStates,
+        pinCol: COL.pin,
+        batteryRow,
+        energyRef: `'${BATTERY_SHEET}'!$F$${batteryFirstRow}`,
+      });
+    }
+  }
 
   // Move the reference tabs to the end (they're created early to supply cell
   // refs, but belong after the budget sheets). References resolve by name.
