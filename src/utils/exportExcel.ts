@@ -2,7 +2,9 @@ import type ExcelJS from 'exceljs';
 import type { Node, Edge } from '@xyflow/react';
 import type {
   AnalysisResult,
+  AuxLoad,
   PowerNodeData,
+  PowerSourceData,
   PowerConverterData,
   LoadData,
   EfficiencyCurveSet,
@@ -596,6 +598,52 @@ function buildSheet(
       typeCell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
       typeCell.alignment = { horizontal: 'center' };
     }
+
+    // Aux loads: individual collapsed detail rows under the node, with the
+    // node's Aux column = live sum of these rows.
+    const auxList = (r.type === 'source' || r.type === 'converter' || r.type === 'series')
+      ? (data as { auxLoads?: AuxLoad[] } | undefined)?.auxLoads
+      : undefined;
+    if (auxList && auxList.length > 0) {
+      const auxPinCells: string[] = [];
+      auxList.forEach((al) => {
+        const arn = ws.addRow([]).number;
+        const aVin = cell('vin', arn), aIout = cell('iout', arn);
+        ws.getCell(`${COL.component}${arn}`).value = `${'   '.repeat(on.depth + 1)}\u21B3 ${al.label || 'Aux load'}`;
+        ws.getCell(`${COL.type}${arn}`).value = 'Aux';
+        if (weighted) {
+          ws.getCell(`${COL.vin}${arn}`).value = { formula: wref(COL.vin, arn) };
+          ws.getCell(`${COL.iout}${arn}`).value = { formula: wref(COL.iout, arn) };
+          ws.getCell(`${COL.pin}${arn}`).value = { formula: wref(COL.pin, arn) };
+        } else {
+          // Aux draws at the node's output voltage.
+          ws.getCell(`${COL.vin}${arn}`).value = { formula: `${COL.vout}${rn}` };
+          if (al.mode === 'resistor') {
+            const R = al.resistance || 0;
+            ws.getCell(`${COL.iout}${arn}`).value = R > 0 ? { formula: `${aVin}/${R}` } : 0;
+          } else {
+            ws.getCell(`${COL.iout}${arn}`).value = al.fixedCurrent || 0;
+          }
+          ws.getCell(`${COL.pin}${arn}`).value = { formula: `${aVin}*${aIout}` };
+          ws.getCell(`${COL.notes}${arn}`).value = al.mode === 'resistor'
+            ? `aux resistor ${al.resistance} \u03A9`
+            : 'aux fixed current';
+        }
+        auxPinCells.push(`${COL.pin}${arn}`);
+        const arow = ws.getRow(arn);
+        arow.outlineLevel = 1;
+        arow.hidden = true;
+        const muted = { italic: true, size: 9, color: { argb: 'FF7A7568' } };
+        ws.getCell(`${COL.component}${arn}`).font = muted;
+        ws.getCell(`${COL.type}${arn}`).font = muted;
+        ws.getCell(`${COL.type}${arn}`).alignment = { horizontal: 'center' };
+      });
+      // Node aux total = sum of its aux rows (model mode; weighted keeps its ref).
+      if (!weighted) {
+        ws.getCell(`${COL.aux}${rn}`).value = { formula: auxPinCells.join('+') };
+      }
+    }
+
     return rn;
   };
 
@@ -682,6 +730,8 @@ function buildSheet(
   }
 
   ws.views = [{ state: 'frozen', ySplit: headerRow.number }];
+  // Aux detail rows are grouped above their summary (the node row) and collapsed.
+  ws.properties.outlineProperties = { summaryBelow: false, summaryRight: false };
 }
 
 /** Build the live η lookup formula (without leading '=') for a converter's output-current cell. */
@@ -829,6 +879,60 @@ function buildProfilesTab(workbook: ExcelJS.Workbook, entries: ProfileEntry[]): 
   return refs;
 }
 
+/** Nominal capacity (mAh) of a battery source, mirroring the canvas node display. */
+function batteryCapacityMah(sd: PowerSourceData): number {
+  const mode = sd.batteryMode || 'simple';
+  if (mode === 'simple') {
+    const caps = sd.capacityAtTemps || [];
+    if (caps.length === 0) return 0;
+    return caps.reduce((s, c) => s + c.capacityMah, 0) / caps.length;
+  }
+  let max = 0;
+  for (const c of sd.dischargeCurves || []) {
+    for (const p of c.points) if (p.capacityMah > max) max = p.capacityMah;
+  }
+  return max;
+}
+
+interface BatteryEntry {
+  label: string;
+  capacityMah: number;
+  nominalV: number;
+  avgPowerW: number;
+  usableFrac: number;
+  bloomLifeHours?: number;
+}
+
+function buildBatteryTab(workbook: ExcelJS.Workbook, entries: BatteryEntry[]) {
+  if (entries.length === 0) return;
+  const ws = workbook.addWorksheet('Battery Life');
+  ws.getCell('A1').value = 'Energy-based life: usable energy (Wh) \u00F7 average input power (W). Edit "Usable %" to model cutoff derating. "Bloom life" is the app\u2019s dynamic discharge result; tune Usable % until \u0394 \u2248 0.';
+  ws.getCell('A1').font = { italic: true, color: { argb: 'FF888888' } };
+  const hr = ws.addRow(['Battery', 'Capacity (mAh)', 'Nominal V', 'Usable %', 'Avg power (W)', 'Usable energy (Wh)', 'Est. life (h)', 'Est. life (days)', 'Bloom life (h)', '\u0394 Est vs Bloom']);
+  styleHeaderRow(hr);
+  for (const e of entries) {
+    const r = ws.addRow([e.label, e.capacityMah, e.nominalV, e.usableFrac, e.avgPowerW, null, null, null, e.bloomLifeHours ?? null, null]);
+    const rn = r.number;
+    // Usable energy (Wh) = capacity(Ah) * nominal V * usable fraction
+    ws.getCell(`F${rn}`).value = { formula: `(B${rn}/1000)*C${rn}*D${rn}` };
+    // Energy-based life: usable energy / average power (constant-power model).
+    ws.getCell(`G${rn}`).value = { formula: `IF(E${rn}=0,0,F${rn}/E${rn})` };
+    ws.getCell(`H${rn}`).value = { formula: `G${rn}/24` };
+    ws.getCell(`J${rn}`).value = { formula: `IF(OR(I${rn}=0,I${rn}=""),"",(G${rn}-I${rn})/I${rn})` };
+    ws.getCell(`B${rn}`).numFmt = '0.0';
+    ws.getCell(`C${rn}`).numFmt = '0.0##';
+    ws.getCell(`D${rn}`).numFmt = '0%';
+    ws.getCell(`E${rn}`).numFmt = '0.000000';
+    ws.getCell(`F${rn}`).numFmt = '0.000';
+    ws.getCell(`G${rn}`).numFmt = '0.0';
+    ws.getCell(`H${rn}`).numFmt = '0.00';
+    ws.getCell(`I${rn}`).numFmt = '0.0';
+    ws.getCell(`J${rn}`).numFmt = '+0.0%;-0.0%';
+  }
+  ws.columns = [{ width: 26 }, { width: 14 }, { width: 11 }, { width: 10 }, { width: 14 }, { width: 18 }, { width: 13 }, { width: 15 }, { width: 14 }, { width: 14 }];
+  ws.views = [{ state: 'frozen', ySplit: hr.number }];
+}
+
 export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<ExcelJS.Workbook> {
   // Dynamic import keeps the ~900KB exceljs bundle out of the initial app load.
   const ExcelJSRuntime = (await import('exceljs')).default;
@@ -917,6 +1021,38 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
       ctx,
     );
   }
+
+  // Battery life tab (after the budget sheets, before the reference tabs).
+  const batteryEntries: BatteryEntry[] = [];
+  for (const r of results) {
+    if (r.type !== 'source') continue;
+    const sd = dataMap.get(r.nodeId) as PowerSourceData | undefined;
+    if (!sd || sd.sourceMode !== 'battery') continue;
+    // Default usable fraction: fraction of the nominal->cutoff window still
+    // available (rough cutoff derate); falls back to 100% when unknown.
+    let usableFrac = 1;
+    const cutoff = sd.cutoffVoltage || 0;
+    if (cutoff > 0 && sd.nominalVoltage > cutoff) {
+      usableFrac = Math.max(0.5, Math.min(1, 1 - (cutoff / sd.nominalVoltage) * 0.15));
+    }
+    batteryEntries.push({
+      label: r.label || r.nodeId,
+      capacityMah: batteryCapacityMah(sd),
+      nominalV: sd.nominalVoltage,
+      avgPowerW: r.inputPowerAvg,
+      usableFrac: Math.round(usableFrac * 100) / 100,
+      bloomLifeHours: r.batteryLifetimeHours,
+    });
+  }
+  buildBatteryTab(workbook, batteryEntries);
+
+  // Move the reference tabs to the end (they're created early to supply cell
+  // refs, but belong after the budget sheets). References resolve by name.
+  const maxOrder = Math.max(0, ...workbook.worksheets.map(w => (w as unknown as { orderNo: number }).orderNo ?? 0));
+  const effWs = workbook.getWorksheet(EFF_SHEET);
+  const profWs = workbook.getWorksheet(PROFILE_SHEET);
+  if (effWs) (effWs as unknown as { orderNo: number }).orderNo = maxOrder + 1;
+  if (profWs) (profWs as unknown as { orderNo: number }).orderNo = maxOrder + 2;
 
   return workbook;
 }
