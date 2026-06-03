@@ -540,6 +540,82 @@ body {
   cursor: not-allowed;
 }
 
+/* Split button: primary Save + caret for related save/export actions */
+.split-btn-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.split-btn {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.split-btn-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: none;
+}
+
+.split-btn-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 7px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.split-btn-caret-icon {
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+/* Subtle divider so the two regions read as separate targets (NN/g guidance) */
+.split-btn-main:not(:disabled) + .split-btn-caret,
+.split-btn-main + .split-btn-caret {
+  border-left: 1px solid color-mix(in srgb, var(--text-dim) 35%, var(--border));
+}
+
+.file-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--surface2);
+  border: 1px solid color-mix(in srgb, var(--text-dim) 50%, var(--border));
+  border-radius: 4px;
+  padding: 2px;
+  min-width: 168px;
+  z-index: 10001;
+  box-shadow: 0 4px 14px var(--shadow-node);
+}
+
+.file-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.file-menu-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: white;
+}
+
+.file-menu-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .analyze-btn {
   padding: 6px 16px;
   background: var(--accent);

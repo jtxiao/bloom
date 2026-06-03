@@ -50,6 +50,7 @@ import {
 } from './utils/cloneForAnalysisWorker';
 import type { AnalysisWorkerResponse } from './workers/analysisWorker.types';
 import { computeUpstreamAncestorOffMap, hasUpstreamAncestorOff } from './utils/upstreamEnabled';
+import { exportPowerBudgetExcel } from './utils/exportExcel';
 
 const nodeTypes = { powerNode: PowerNode, groupNode: GroupNode, textNode: TextNode };
 const edgeTypes = { smart: SmartBezierEdge };
@@ -1765,6 +1766,43 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     }
   }, [buildProjectJson, projectName, showSaveToast]);
 
+  const exportExcel = useCallback(async () => {
+    if (nodes.length === 0) return;
+    if (results.length === 0) {
+      showLoadError('Run analysis first (click Details) so there are results to export.');
+      return;
+    }
+    try {
+      await exportPowerBudgetExcel({
+        projectName,
+        nodes: nodes as unknown as Node[],
+        edges: edges as unknown as Edge[],
+        results,
+        powerStates,
+        activeScenario,
+      });
+      showSaveToast();
+    } catch {
+      showLoadError('Could not generate the Excel file.');
+    }
+  }, [nodes, edges, results, powerStates, activeScenario, projectName, showLoadError, showSaveToast]);
+
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!fileMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) setFileMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFileMenuOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [fileMenuOpen]);
+
   const onTextNodeChangeRef = useRef(onTextNodeChange);
   onTextNodeChangeRef.current = onTextNodeChange;
 
@@ -2043,12 +2081,44 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             <Tooltip text="Open a saved project file (.json)">
               <button className="toolbar-btn secondary" onClick={loadProject}>Load</button>
             </Tooltip>
-            <Tooltip text="Save to the current file (Cmd+S)">
-              <button className="toolbar-btn secondary" onClick={saveProject} disabled={nodes.length === 0}>Save</button>
-            </Tooltip>
-            <Tooltip text="Save as a new file">
-              <button className="toolbar-btn secondary" onClick={saveAsProject} disabled={nodes.length === 0}>Save As</button>
-            </Tooltip>
+            <div className="split-btn-wrap" ref={fileMenuRef}>
+              <div className="split-btn">
+                <Tooltip text="Save to the current file (Cmd+S)">
+                  <button className="toolbar-btn secondary split-btn-main" onClick={() => { setFileMenuOpen(false); saveProject(); }} disabled={nodes.length === 0}>Save</button>
+                </Tooltip>
+                <Tooltip text="More save & export options">
+                  <button
+                    className="toolbar-btn secondary split-btn-caret"
+                    aria-haspopup="menu"
+                    aria-expanded={fileMenuOpen}
+                    aria-label="More save and export options"
+                    onClick={() => setFileMenuOpen(o => !o)}
+                  >
+                    <span className="split-btn-caret-icon">▾</span>
+                  </button>
+                </Tooltip>
+              </div>
+              {fileMenuOpen && (
+                <div className="file-menu" role="menu">
+                  <button
+                    className="file-menu-item"
+                    role="menuitem"
+                    disabled={nodes.length === 0}
+                    onClick={() => { setFileMenuOpen(false); saveAsProject(); }}
+                  >
+                    Save As…
+                  </button>
+                  <button
+                    className="file-menu-item"
+                    role="menuitem"
+                    disabled={nodes.length === 0 || results.length === 0}
+                    onClick={() => { setFileMenuOpen(false); exportExcel(); }}
+                  >
+                    Export to Excel…
+                  </button>
+                </div>
+              )}
+            </div>
             <Tooltip text="Open the analysis results panel with power, loss, and efficiency breakdowns">
               <button className="analyze-btn" onClick={openResults} disabled={nodes.length === 0}>Details</button>
             </Tooltip>
