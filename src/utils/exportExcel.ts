@@ -1007,21 +1007,19 @@ function buildFeatureImpactTab(workbook: ExcelJS.Workbook, opts: FeatureTabOpts)
   states.forEach((st, i) => {
     const rn = first + i;
     ws.getCell(rn, 1).value = st.name;
-    // B active-for, C unit, D every, E unit are user inputs (defaults: idle blank).
-    const isIdleDefault = i === states.length - 1;
-    if (!isIdleDefault) {
-      ws.getCell(rn, 2).value = 0;     // active duration
-      ws.getCell(rn, 3).value = 's';
-      ws.getCell(rn, 4).value = 1;     // period
-      ws.getCell(rn, 5).value = 'day';
-    }
+    // Every row gets real default inputs (no blanks). The state chosen as idle
+    // ignores these and takes the remaining time share instead.
+    ws.getCell(rn, 2).value = 0;     // active duration
+    ws.getCell(rn, 3).value = 's';
+    ws.getCell(rn, 4).value = 1;     // period
+    ws.getCell(rn, 5).value = 'day';
     // unit dropdowns
     for (const col of [3, 5]) {
       ws.getCell(rn, col).dataValidation = { type: 'list', allowBlank: true, formulae: [`"${UNIT_LIST}"`] };
     }
     const B = `B${rn}`, C = `C${rn}`, D = `D${rn}`, E = `E${rn}`, F = `F${rn}`;
-    // On-time fraction = (dur*unit) / (period*unit)
-    ws.getCell(rn, 6).value = { formula: `IF(OR(${B}="",${D}="",${D}=0),"",(${B}*VLOOKUP(${C},${unitsRange},2,FALSE))/(${D}*VLOOKUP(${E},${unitsRange},2,FALSE)))` };
+    // On-time fraction = (dur*unit) / (period*unit); idle row shows "(idle)".
+    ws.getCell(rn, 6).value = { formula: `IF($C$4=A${rn},"(idle)",IF(OR(${B}="",${D}="",${D}=0),"",(${B}*VLOOKUP(${C},${unitsRange},2,FALSE))/(${D}*VLOOKUP(${E},${unitsRange},2,FALSE))))` };
     ws.getCell(rn, 6).numFmt = '0.000%';
     // Time share: idle row gets the remainder; others get their on-time.
     ws.getCell(rn, 7).value = { formula: `IF($C$4=A${rn},MAX(0,1-SUM($F$${first}:$F$${first + states.length - 1})),IF(${F}="",0,${F}))` };
@@ -1060,6 +1058,9 @@ function buildFeatureImpactTab(workbook: ExcelJS.Workbook, opts: FeatureTabOpts)
   setKV('Battery life (days):', `IF(${totalP}=0,0,$C$5/(${totalP})/24)`, '0.00', true);
   setKV('Battery life (weeks):', `IF(${totalP}=0,0,$C$5/(${totalP})/24/7)`, '0.00');
   setKV('Battery life (months):', `IF(${totalP}=0,0,$C$5/(${totalP})/24/30.44)`, '0.00');
+  rr += 1;
+  ws.getCell(rr, 1).value = 'Note: the idle state (selected at top) ignores its Active for / every and fills the remaining time share.';
+  ws.getCell(rr, 1).font = { italic: true, size: 9, color: { argb: 'FF888888' } };
 
   ws.columns = [{ width: 22 }, { width: 12 }, { width: 9 }, { width: 10 }, { width: 9 }, { width: 12 }, { width: 12 }, { width: 16 }, { width: 16 }, { width: 4 }, { width: 4 }, { width: 4 }, { width: 8 }, { width: 10 }];
 }
