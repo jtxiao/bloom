@@ -391,7 +391,7 @@ function buildNodeData(
         efficiencyCurves: hasCurve
           ? [{ inputVoltage: curve!.vin || n.vout, points: curve!.points }]
           : [],
-        enabled: true,
+        enabled: !n.disabled,
         ...aux,
       };
     }
@@ -403,7 +403,7 @@ function buildNodeData(
         seriesMode: 'resistor',
         resistance,
         forwardVoltage: 0,
-        enabled: true,
+        enabled: !n.disabled,
         ...aux,
       };
     }
@@ -417,7 +417,7 @@ function buildNodeData(
         resistance: n.vout > 0 && n.iout > 0 ? n.vout / n.iout : 100,
         fixedCurrent: n.iout || 0,
         loadProfile: [] as { time: number; current: number }[],
-        enabled: true,
+        enabled: !n.disabled,
       };
       if (prof?.kind === 'profile') {
         return { ...base, loadMode: 'current_profile', loadProfile: prof.points };
