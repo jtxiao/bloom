@@ -267,13 +267,39 @@ export async function importProjectFromExcel(file: File): Promise<string> {
   const effMap = parseEfficiencyTab(wb);
   const profileMap = parseProfilesTab(wb);
 
-  // Auto-layout: column by depth, stacked vertically in row order.
-  let yCursor = 80;
-  const nodes = canonical.map(n => {
-    const position = { x: 80 + n.depth * 280, y: yCursor };
-    yCursor += 120;
-    return { id: n.id, type: 'powerNode', position, data: buildNodeData(n, batteryMap, effMap, profileMap) };
-  });
+  // Tidy tree layout: x by depth (left->right), y so leaves stack and each
+  // parent is centered on its children (avoids a diagonal cascade).
+  const COL_W = 320, ROW_H = 110;
+  const childrenMap = new Map<string, string[]>();
+  for (const e of edges) {
+    const arr = childrenMap.get(e.source) ?? [];
+    arr.push(e.target);
+    childrenMap.set(e.source, arr);
+  }
+  const yOf = new Map<string, number>();
+  let nextLeafY = 80;
+  const assignY = (id: string): number => {
+    if (yOf.has(id)) return yOf.get(id)!;
+    const kids = childrenMap.get(id) ?? [];
+    let y: number;
+    if (kids.length === 0) { y = nextLeafY; nextLeafY += ROW_H; }
+    else {
+      const ys = kids.map(assignY);
+      y = (Math.min(...ys) + Math.max(...ys)) / 2;
+    }
+    yOf.set(id, y);
+    return y;
+  };
+  const hasParent = new Set(edges.map(e => e.target));
+  for (const n of canonical) if (!hasParent.has(n.id)) assignY(n.id);
+  for (const n of canonical) if (!yOf.has(n.id)) assignY(n.id); // any stragglers
+
+  const nodes = canonical.map(n => ({
+    id: n.id,
+    type: 'powerNode',
+    position: { x: 80 + n.depth * COL_W, y: yOf.get(n.id) ?? 80 },
+    data: buildNodeData(n, batteryMap, effMap, profileMap),
+  }));
 
   // Reconstruct power states from each per-state sheet (or one state if single).
   const powerStates = sourceSheets.map((s, si) => {
