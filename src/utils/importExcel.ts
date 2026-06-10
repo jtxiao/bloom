@@ -4,12 +4,15 @@ import type ExcelJS from 'exceljs';
  * Reconstruct a project from an exported power-budget workbook by reading the
  * (possibly edited) cell VALUES on the Summary budget sheet — no embedded JSON.
  *
- * This is intentionally a simplified round-trip: it rebuilds the tree topology
- * (from row indentation), node types, and the key editable inputs (voltages,
- * load currents, converter efficiency/Iq, source/battery values, aux loads).
- * Advanced data not represented as plain budget inputs (efficiency curves,
- * load profiles, multi-state load snapshots, battery discharge curves) is
- * flattened to simple equivalents.
+ * It rebuilds the tree topology (from row indentation), node types, and the
+ * editable inputs (voltages, load currents, converter Iq, source/battery
+ * values, aux loads). It also reads the "Efficiency Curves" and "Load Profiles"
+ * tabs to restore converter efficiency curves and load current profiles / pulse
+ * settings. Remaining simplifications: efficiency curves come back as a single
+ * curve at the operating Vin (the export collapses the Vin dimension), profiles
+ * are the condensed/downsampled version the export wrote, and the project is
+ * rebuilt as a single state (multi-state snapshots and battery discharge curves
+ * are not reconstructed).
  */
 
 type CellVal = number | string | { formula?: string; result?: number | string } | null | undefined;
@@ -59,6 +62,77 @@ interface ParsedNode {
 let _impId = 0;
 const nextId = () => `node_${++_impId}`;
 const nextAuxId = () => `aux_${Date.now()}_${++_impId}`;
+
+interface EffCurve { vin: number; points: { loadCurrent: number; efficiency: number }[]; }
+type ProfileInfo =
+  | { kind: 'profile'; points: { time: number; current: number }[] }
+  | { kind: 'pulse'; baseline: number; peak: number; period: number; dutyCycle: number };
+
+/** Read the "Efficiency Curves" tab into label -> effective curve at operating Vin. */
+function parseEfficiencyTab(wb: ExcelJS.Workbook): Map<string, EffCurve> {
+  const map = new Map<string, EffCurve>();
+  const ws = wb.getWorksheet('Efficiency Curves');
+  if (!ws) return map;
+  let cur: { label: string; vin: number; points: EffCurve['points'] } | null = null;
+  const flush = () => { if (cur && cur.points.length > 0) map.set(cur.label, { vin: cur.vin, points: cur.points }); cur = null; };
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const aStr = strOf(ws.getCell(r, 1).value as CellVal);
+    const header = aStr.match(/^(.*?)\s+\(Vin/);
+    if (header) {
+      flush();
+      const vinM = aStr.match(/([\d.]+)\s*V\)/);
+      cur = { label: header[1].trim(), vin: vinM ? parseFloat(vinM[1]) : 0, points: [] };
+      continue;
+    }
+    if (aStr === 'Iout (A)') continue;
+    if (cur) {
+      const ia = numOf(ws.getCell(r, 1).value as CellVal);
+      const ib = numOf(ws.getCell(r, 2).value as CellVal);
+      if (!isNaN(ia) && !isNaN(ib)) cur.points.push({ loadCurrent: ia, efficiency: ib });
+      else if (aStr === '') flush();
+    }
+  }
+  flush();
+  return map;
+}
+
+/** Read the "Load Profiles" tab into label -> profile points or pulse settings. */
+function parseProfilesTab(wb: ExcelJS.Workbook): Map<string, ProfileInfo> {
+  const map = new Map<string, ProfileInfo>();
+  const ws = wb.getWorksheet('Load Profiles');
+  if (!ws) return map;
+  const FIELD_LABELS = new Set(['Baseline current (A)', 'Pulse current (A)', 'Period (s)', 'Pulse width (s)', 'Average current (A)', 'Time (s)', 'Current (A)', 'Duration (s)']);
+  let pendingLabel = '';
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const aStr = strOf(ws.getCell(r, 1).value as CellVal).trim();
+    if (aStr === 'Baseline current (A)') {
+      const baseline = numOf(ws.getCell(r, 2).value as CellVal) || 0;
+      const peak = numOf(ws.getCell(r + 1, 2).value as CellVal) || 0;
+      const period = numOf(ws.getCell(r + 2, 2).value as CellVal) || 0;
+      const width = numOf(ws.getCell(r + 3, 2).value as CellVal) || 0;
+      if (pendingLabel) map.set(pendingLabel, { kind: 'pulse', baseline, peak, period, dutyCycle: period > 0 ? width / period : 0 });
+      r += 4;
+      continue;
+    }
+    if (aStr === 'Time (s)') {
+      const points: { time: number; current: number }[] = [];
+      let k = r + 1;
+      for (; k <= ws.rowCount; k++) {
+        const t = numOf(ws.getCell(k, 1).value as CellVal);
+        const i = numOf(ws.getCell(k, 2).value as CellVal);
+        if (isNaN(t) || isNaN(i)) break;
+        points.push({ time: t, current: i });
+      }
+      if (pendingLabel && points.length > 0) map.set(pendingLabel, { kind: 'profile', points });
+      r = k - 1;
+      continue;
+    }
+    if (aStr && !FIELD_LABELS.has(aStr) && isNaN(numOf(ws.getCell(r, 1).value as CellVal))) {
+      pendingLabel = aStr;
+    }
+  }
+  return map;
+}
 
 function findHeaderRow(ws: ExcelJS.Worksheet): number {
   for (let r = 1; r <= Math.min(ws.rowCount, 20); r++) {
@@ -175,12 +249,15 @@ export async function importProjectFromExcel(file: File): Promise<string> {
     }
   }
 
+  const effMap = parseEfficiencyTab(wb);
+  const profileMap = parseProfilesTab(wb);
+
   // Auto-layout: column by depth, stacked vertically in row order.
   let yCursor = 80;
   const nodes = parsed.map(n => {
     const position = { x: 80 + n.depth * 280, y: yCursor };
     yCursor += 120;
-    return { id: n.id, type: 'powerNode', position, data: buildNodeData(n, batteryMap) };
+    return { id: n.id, type: 'powerNode', position, data: buildNodeData(n, batteryMap, effMap, profileMap) };
   });
 
   const projectName = (strOf(ws.getCell(1, 1).value as CellVal).replace(/ —.*$/, '').trim()) || 'Imported project';
@@ -201,6 +278,8 @@ export async function importProjectFromExcel(file: File): Promise<string> {
 function buildNodeData(
   n: ParsedNode,
   batteryMap: Map<string, { capacityMah: number; nominalV: number }>,
+  effMap: Map<string, EffCurve>,
+  profileMap: Map<string, ProfileInfo>,
 ): Record<string, unknown> {
   const aux = n.auxLoads.length > 0 ? { auxLoads: n.auxLoads } : {};
   switch (n.nodeType) {
@@ -221,19 +300,24 @@ function buildNodeData(
         ...aux,
       };
     }
-    case 'converter':
+    case 'converter': {
+      const curve = effMap.get(n.label);
+      const hasCurve = !n.effIsLdo && curve && curve.points.length > 1;
       return {
         type: 'converter',
         label: n.label,
         converterType: n.effIsLdo ? 'ldo' : 'switching',
         outputVoltage: n.vout,
         quiescentCurrent: n.iq || 0,
-        efficiencyMode: 'flat',
+        efficiencyMode: hasCurve ? 'curve' : 'flat',
         flatEfficiency: n.eff > 0 ? Math.min(1, n.eff) : 0.9,
-        efficiencyCurves: [],
+        efficiencyCurves: hasCurve
+          ? [{ inputVoltage: curve!.vin || n.vout, points: curve!.points }]
+          : [],
         enabled: true,
         ...aux,
       };
+    }
     case 'series': {
       const resistance = n.iout > 0 && n.loss > 0 ? n.loss / (n.iout * n.iout) : 0.05;
       return {
@@ -247,16 +331,31 @@ function buildNodeData(
       };
     }
     case 'load':
-    default:
-      return {
+    default: {
+      const prof = profileMap.get(n.label);
+      const base = {
         type: 'load',
         label: n.label,
         voltage: n.vout,
-        loadMode: 'fixed_current',
-        loadProfile: [],
         resistance: n.vout > 0 && n.iout > 0 ? n.vout / n.iout : 100,
         fixedCurrent: n.iout || 0,
+        loadProfile: [] as { time: number; current: number }[],
         enabled: true,
       };
+      if (prof?.kind === 'profile') {
+        return { ...base, loadMode: 'current_profile', loadProfile: prof.points };
+      }
+      if (prof?.kind === 'pulse') {
+        return {
+          ...base,
+          loadMode: 'pulse_duty',
+          pulseBaselineCurrent: prof.baseline,
+          pulsePeakCurrent: prof.peak,
+          pulsePeriodSeconds: prof.period,
+          pulseDutyCycle: prof.dutyCycle,
+        };
+      }
+      return { ...base, loadMode: 'fixed_current' };
+    }
   }
 }
