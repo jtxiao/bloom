@@ -201,32 +201,6 @@ function parseProfilesTab(wb: ExcelJS.Workbook): Map<string, ProfileInfo> {
   return map;
 }
 
-/**
- * Recover original canvas positions from the Diagram tab (blocks are placed at
- * scaled canvas coordinates). Returns label -> queue of {x,y} in canvas units.
- * Same-label blocks are returned in reading order; callers dequeue per node.
- */
-function parseDiagramPositions(wb: ExcelJS.Workbook, labels: Set<string>): Map<string, { x: number; y: number }[]> {
-  const map = new Map<string, { x: number; y: number }[]>();
-  const ws = wb.getWorksheet('Diagram');
-  if (!ws) return map;
-  // Inverse of the export scale (SCALE_X=0.05, SCALE_Y=0.055, offsets 2 cols / 4 rows).
-  const INV_X = 1 / 0.05, INV_Y = 1 / 0.055;
-  ws.eachRow({ includeEmpty: false }, (row, rNum) => {
-    row.eachCell({ includeEmpty: false }, (cell, cNum) => {
-      if (typeof cell.value !== 'string') return;
-      const label = cell.value.replace(/\s*\(off\)\s*$/, '').trim();
-      if (!labels.has(label)) return;
-      const x = (cNum - 2) * INV_X;
-      const y = (rNum - 4) * INV_Y;
-      const arr = map.get(label) ?? [];
-      arr.push({ x, y });
-      map.set(label, arr);
-    });
-  });
-  return map;
-}
-
 function findHeaderRow(ws: ExcelJS.Worksheet): number {
   for (let r = 1; r <= Math.min(ws.rowCount, 20); r++) {
     if (strOf(ws.getCell(r, 1).value as CellVal).trim() === 'Component') return r;
@@ -320,23 +294,12 @@ export async function importProjectFromExcel(file: File): Promise<string> {
   for (const n of canonical) if (!hasParent.has(n.id)) assignY(n.id);
   for (const n of canonical) if (!yOf.has(n.id)) assignY(n.id); // any stragglers
 
-  // Prefer original canvas positions from the Diagram tab (matched by label),
-  // falling back to the tidy-tree layout for any node without one.
-  const diagPos = parseDiagramPositions(wb, new Set(canonical.map(n => n.label)));
-  const diagQueues = new Map<string, { x: number; y: number }[]>();
-  for (const [l, arr] of diagPos) diagQueues.set(l, [...arr]);
-
-  const nodes = canonical.map(n => {
-    const q = diagQueues.get(n.label);
-    const p = q && q.length > 0 ? q.shift()! : null;
-    const position = p ?? { x: 80 + n.depth * COL_W, y: yOf.get(n.id) ?? 80 };
-    return {
-      id: n.id,
-      type: 'powerNode',
-      position,
-      data: buildNodeData(n, batteryMap, effMap, profileMap),
-    };
-  });
+  const nodes = canonical.map(n => ({
+    id: n.id,
+    type: 'powerNode',
+    position: { x: 80 + n.depth * COL_W, y: yOf.get(n.id) ?? 80 },
+    data: buildNodeData(n, batteryMap, effMap, profileMap),
+  }));
 
   // Reconstruct power states from each per-state sheet (or one state if single).
   const powerStates = sourceSheets.map((s, si) => {
