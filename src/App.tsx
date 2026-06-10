@@ -1790,19 +1790,22 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
 
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
   const fileMenuRef = useRef<HTMLDivElement>(null);
+  const [loadMenuOpen, setLoadMenuOpen] = useState(false);
+  const loadMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!fileMenuOpen) return;
+    if (!fileMenuOpen && !loadMenuOpen) return;
     const onDown = (e: MouseEvent) => {
       if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) setFileMenuOpen(false);
+      if (loadMenuRef.current && !loadMenuRef.current.contains(e.target as Node)) setLoadMenuOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFileMenuOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setFileMenuOpen(false); setLoadMenuOpen(false); } };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
     };
-  }, [fileMenuOpen]);
+  }, [fileMenuOpen, loadMenuOpen]);
 
   const onTextNodeChangeRef = useRef(onTextNodeChange);
   onTextNodeChangeRef.current = onTextNodeChange;
@@ -2119,9 +2122,35 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
             <Tooltip text="Create a new empty project (unsaved changes will prompt to save)">
               <button className="toolbar-btn secondary" onClick={newProject}>New</button>
             </Tooltip>
-            <Tooltip text="Open a saved project file (.json)">
-              <button className="toolbar-btn secondary" onClick={loadProject}>Load</button>
-            </Tooltip>
+            <div className="split-btn-wrap" ref={loadMenuRef}>
+              <div className="split-btn">
+                <Tooltip text="Open a saved project file (.json)">
+                  <button className="toolbar-btn secondary split-btn-main" onClick={() => { setLoadMenuOpen(false); loadProject(); }}>Load</button>
+                </Tooltip>
+                <Tooltip text="More open & import options">
+                  <button
+                    className="toolbar-btn secondary split-btn-caret"
+                    aria-haspopup="menu"
+                    aria-expanded={loadMenuOpen}
+                    aria-label="More open and import options"
+                    onClick={() => setLoadMenuOpen(o => !o)}
+                  >
+                    <span className="split-btn-caret-icon">▾</span>
+                  </button>
+                </Tooltip>
+              </div>
+              {loadMenuOpen && (
+                <div className="file-menu" role="menu">
+                  <button
+                    className="file-menu-item"
+                    role="menuitem"
+                    onClick={() => { setLoadMenuOpen(false); importExcel(); }}
+                  >
+                    Import from Excel…
+                  </button>
+                </div>
+              )}
+            </div>
             <div className="split-btn-wrap" ref={fileMenuRef}>
               <div className="split-btn">
                 <Tooltip text="Save to the current file (Cmd+S)">
@@ -2156,13 +2185,6 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
                     onClick={() => { setFileMenuOpen(false); exportExcel(); }}
                   >
                     Export to Excel…
-                  </button>
-                  <button
-                    className="file-menu-item"
-                    role="menuitem"
-                    onClick={() => { setFileMenuOpen(false); importExcel(); }}
-                  >
-                    Import from Excel…
                   </button>
                 </div>
               )}
