@@ -17,6 +17,14 @@ import type ExcelJS from 'exceljs';
 
 type CellVal = number | string | { formula?: string; result?: number | string } | null | undefined;
 
+/** Round to ~6 significant figures to drop floating-point noise (3.9699999... -> 3.97). */
+function clean(x: number): number {
+  if (!isFinite(x) || x === 0) return x;
+  const digits = Math.ceil(Math.log10(Math.abs(x)));
+  const f = Math.pow(10, 6 - digits);
+  return Math.round(x * f) / f;
+}
+
 function numOf(v: CellVal): number {
   if (typeof v === 'number') return v;
   if (v && typeof v === 'object') {
@@ -83,7 +91,7 @@ function parseSheetNodes(ws: ExcelJS.Worksheet, headerRow: number, col: BudgetCo
         const m = note.match(/([\d.]+)/);
         lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'resistor', resistance: m ? parseFloat(m[1]) : 0, fixedCurrent: 0 });
       } else {
-        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'fixed_current', resistance: 0, fixedCurrent: isNaN(iout) ? 0 : iout });
+        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'fixed_current', resistance: 0, fixedCurrent: isNaN(iout) ? 0 : clean(iout) });
       }
       continue;
     }
@@ -98,12 +106,12 @@ function parseSheetNodes(ws: ExcelJS.Worksheet, headerRow: number, col: BudgetCo
       nodeType: t as ParsedNode['nodeType'],
       label: compTrim || `Node ${parsed.length + 1}`,
       depth: Math.round(leadingSpaces / 3),
-      vout: numOf(ws.getCell(r, col.vout).value as CellVal) || 0,
-      iout: numOf(ws.getCell(r, col.iout).value as CellVal) || 0,
-      eff: numOf(effCell) || 0,
+      vout: clean(numOf(ws.getCell(r, col.vout).value as CellVal) || 0),
+      iout: clean(numOf(ws.getCell(r, col.iout).value as CellVal) || 0),
+      eff: clean(numOf(effCell) || 0),
       effIsLdo: /MIN\(/i.test(formulaOf(effCell)),
-      iq: numOf(ws.getCell(r, col.iq).value as CellVal) || 0,
-      loss: numOf(ws.getCell(r, col.loss).value as CellVal) || 0,
+      iq: clean(numOf(ws.getCell(r, col.iq).value as CellVal) || 0),
+      loss: clean(numOf(ws.getCell(r, col.loss).value as CellVal) || 0),
       disabled: /disabled/i.test(strOf(ws.getCell(r, col.notes).value as CellVal)),
       auxLoads: [],
     };
@@ -242,8 +250,8 @@ export async function importProjectFromExcel(file: File): Promise<string> {
       const label = strOf(bt.getCell(r, 1).value as CellVal).trim();
       if (!label) continue;
       batteryMap.set(label, {
-        capacityMah: numOf(bt.getCell(r, 2).value as CellVal) || 0,
-        nominalV: numOf(bt.getCell(r, 3).value as CellVal) || 0,
+        capacityMah: clean(numOf(bt.getCell(r, 2).value as CellVal) || 0),
+        nominalV: clean(numOf(bt.getCell(r, 3).value as CellVal) || 0),
       });
     }
   }
