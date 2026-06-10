@@ -56,7 +56,74 @@ interface ParsedNode {
   effIsLdo: boolean;
   iq: number;
   loss: number;
+  disabled: boolean;
   auxLoads: { id: string; label: string; mode: 'resistor' | 'fixed_current'; resistance: number; fixedCurrent: number }[];
+}
+
+interface BudgetCols { component: number; type: number; vout: number; iout: number; eff: number; loss: number; iq: number; notes: number; }
+
+/** Parse one budget sheet's component rows (topology + per-node values). */
+function parseSheetNodes(ws: ExcelJS.Worksheet, headerRow: number, col: BudgetCols): ParsedNode[] {
+  const parsed: ParsedNode[] = [];
+  let lastNode: ParsedNode | null = null;
+  for (let r = headerRow + 1; r <= ws.rowCount; r++) {
+    const rawComp = strOf(ws.getCell(r, col.component).value as CellVal);
+    const typeStr = strOf(ws.getCell(r, col.type).value as CellVal).trim();
+    const compTrim = rawComp.trim();
+    if (compTrim === 'SYSTEM TOTAL') break;
+    if (compTrim.startsWith('Subtotal')) continue;
+    if (!typeStr) continue;
+
+    if (typeStr === 'Aux') {
+      if (!lastNode) continue;
+      const label = compTrim.replace(/^\u21B3\s*/, '');
+      const note = strOf(ws.getCell(r, col.notes).value as CellVal);
+      const iout = numOf(ws.getCell(r, col.iout).value as CellVal);
+      if (/resistor/i.test(note)) {
+        const m = note.match(/([\d.]+)/);
+        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'resistor', resistance: m ? parseFloat(m[1]) : 0, fixedCurrent: 0 });
+      } else {
+        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'fixed_current', resistance: 0, fixedCurrent: isNaN(iout) ? 0 : iout });
+      }
+      continue;
+    }
+
+    const t = typeStr.toLowerCase();
+    if (t !== 'source' && t !== 'converter' && t !== 'series' && t !== 'load') continue;
+
+    const leadingSpaces = rawComp.length - rawComp.replace(/^\s+/, '').length;
+    const effCell = ws.getCell(r, col.eff).value as CellVal;
+    const node: ParsedNode = {
+      id: '',
+      nodeType: t as ParsedNode['nodeType'],
+      label: compTrim || `Node ${parsed.length + 1}`,
+      depth: Math.round(leadingSpaces / 3),
+      vout: numOf(ws.getCell(r, col.vout).value as CellVal) || 0,
+      iout: numOf(ws.getCell(r, col.iout).value as CellVal) || 0,
+      eff: numOf(effCell) || 0,
+      effIsLdo: /MIN\(/i.test(formulaOf(effCell)),
+      iq: numOf(ws.getCell(r, col.iq).value as CellVal) || 0,
+      loss: numOf(ws.getCell(r, col.loss).value as CellVal) || 0,
+      disabled: /disabled/i.test(strOf(ws.getCell(r, col.notes).value as CellVal)),
+      auxLoads: [],
+    };
+    parsed.push(node);
+    lastNode = node;
+  }
+  return parsed;
+}
+
+function colsFor(ws: ExcelJS.Worksheet, headerRow: number): BudgetCols {
+  return {
+    component: 1,
+    type: columnIndex(ws, headerRow, 'Type'),
+    vout: columnIndex(ws, headerRow, 'Vout (V)'),
+    iout: columnIndex(ws, headerRow, 'Iout (A)'),
+    eff: columnIndex(ws, headerRow, 'Eff'),
+    loss: columnIndex(ws, headerRow, 'Loss (W)'),
+    iq: columnIndex(ws, headerRow, 'Iq (A)'),
+    notes: columnIndex(ws, headerRow, 'Notes'),
+  };
 }
 
 let _impId = 0;
@@ -154,23 +221,20 @@ export async function importProjectFromExcel(file: File): Promise<string> {
   const wb = new ExcelJSRuntime.Workbook();
   await wb.xlsx.load(await file.arrayBuffer());
 
-  const ws = wb.getWorksheet('Summary') ?? wb.worksheets.find(w => findHeaderRow(w) > 0);
-  if (!ws) throw new Error('No budget sheet found (expected a "Summary" tab).');
-  const headerRow = findHeaderRow(ws);
-  if (headerRow < 0) throw new Error('Could not find the budget table header.');
+  // Budget sheets (those with a Component header). The multi-state "Summary"
+  // is duty-weighted FORMULAS (no values without recalc), so prefer the
+  // per-state sheets, which carry the actual input values. Fall back to Summary
+  // for single-state exports (its Summary holds real values).
+  const budgetSheets = wb.worksheets
+    .map(w => ({ ws: w, hr: findHeaderRow(w) }))
+    .filter(x => x.hr > 0);
+  if (budgetSheets.length === 0) throw new Error('No budget sheet found.');
+  const stateSheets = budgetSheets.filter(x => x.ws.name !== 'Summary');
+  const sourceSheets = stateSheets.length > 0 ? stateSheets : budgetSheets;
+  const base = sourceSheets[0];
+  const baseCols = colsFor(base.ws, base.hr);
 
-  const col = {
-    component: 1,
-    type: columnIndex(ws, headerRow, 'Type'),
-    vout: columnIndex(ws, headerRow, 'Vout (V)'),
-    iout: columnIndex(ws, headerRow, 'Iout (A)'),
-    eff: columnIndex(ws, headerRow, 'Eff'),
-    loss: columnIndex(ws, headerRow, 'Loss (W)'),
-    iq: columnIndex(ws, headerRow, 'Iq (A)'),
-    notes: columnIndex(ws, headerRow, 'Notes'),
-  };
-
-  // Battery capacity / nominal V map (label -> {capacityMah, nominalV}).
+  // Battery capacity / nominal V map.
   const batteryMap = new Map<string, { capacityMah: number; nominalV: number }>();
   const bt = wb.getWorksheet('Battery Life');
   if (bt) {
@@ -184,68 +248,19 @@ export async function importProjectFromExcel(file: File): Promise<string> {
     }
   }
 
-  const parsed: ParsedNode[] = [];
-  let lastNode: ParsedNode | null = null;
+  // Canonical node list + ids from the first per-state sheet.
+  const canonical = parseSheetNodes(base.ws, base.hr, baseCols);
+  if (canonical.length === 0) throw new Error('No component rows found in the budget sheet.');
+  canonical.forEach(n => { n.id = nextId(); });
 
-  for (let r = headerRow + 1; r <= ws.rowCount; r++) {
-    const rawComp = strOf(ws.getCell(r, col.component).value as CellVal);
-    const typeStr = strOf(ws.getCell(r, col.type).value as CellVal).trim();
-    const compTrim = rawComp.trim();
-    if (compTrim === 'SYSTEM TOTAL') break;
-    if (compTrim.startsWith('Subtotal')) continue;
-    if (!typeStr) continue;
-
-    if (typeStr === 'Aux') {
-      if (!lastNode) continue;
-      const label = compTrim.replace(/^\u21B3\s*/, '');
-      const note = strOf(ws.getCell(r, col.notes).value as CellVal);
-      const iout = numOf(ws.getCell(r, col.iout).value as CellVal);
-      if (/resistor/i.test(note)) {
-        const m = note.match(/([\d.]+)/);
-        const resistance = m ? parseFloat(m[1]) : 0;
-        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'resistor', resistance: resistance || 0, fixedCurrent: 0 });
-      } else {
-        lastNode.auxLoads.push({ id: nextAuxId(), label, mode: 'fixed_current', resistance: 0, fixedCurrent: isNaN(iout) ? 0 : iout });
-      }
-      continue;
-    }
-
-    const t = typeStr.toLowerCase();
-    if (t !== 'source' && t !== 'converter' && t !== 'series' && t !== 'load') continue;
-
-    const leadingSpaces = rawComp.length - rawComp.replace(/^\s+/, '').length;
-    const depth = Math.round(leadingSpaces / 3);
-    const effCell = ws.getCell(r, col.eff).value as CellVal;
-    const node: ParsedNode = {
-      id: nextId(),
-      nodeType: t as ParsedNode['nodeType'],
-      label: compTrim || `Node ${parsed.length + 1}`,
-      depth,
-      vout: numOf(ws.getCell(r, col.vout).value as CellVal) || 0,
-      iout: numOf(ws.getCell(r, col.iout).value as CellVal) || 0,
-      eff: numOf(effCell) || 0,
-      effIsLdo: /MIN\(/i.test(formulaOf(effCell)),
-      iq: numOf(ws.getCell(r, col.iq).value as CellVal) || 0,
-      loss: numOf(ws.getCell(r, col.loss).value as CellVal) || 0,
-      auxLoads: [],
-    };
-    parsed.push(node);
-    lastNode = node;
-  }
-
-  if (parsed.length === 0) throw new Error('No component rows found in the budget sheet.');
-
-  // Build edges from indentation: parent = nearest preceding node at depth-1.
+  // Edges from indentation: parent = nearest preceding node at depth-1.
   const lastIdAtDepth: Record<number, string> = {};
   const edges: { id: string; source: string; target: string; sourceHandle: string; targetHandle: string }[] = [];
   let edgeNum = 0;
-  for (const n of parsed) {
+  for (const n of canonical) {
     lastIdAtDepth[n.depth] = n.id;
-    if (n.depth > 0) {
-      const parentId = lastIdAtDepth[n.depth - 1];
-      if (parentId) {
-        edges.push({ id: `e_${++edgeNum}`, source: parentId, target: n.id, sourceHandle: 'source', targetHandle: 'target' });
-      }
+    if (n.depth > 0 && lastIdAtDepth[n.depth - 1]) {
+      edges.push({ id: `e_${++edgeNum}`, source: lastIdAtDepth[n.depth - 1], target: n.id, sourceHandle: 'source', targetHandle: 'target' });
     }
   }
 
@@ -254,13 +269,49 @@ export async function importProjectFromExcel(file: File): Promise<string> {
 
   // Auto-layout: column by depth, stacked vertically in row order.
   let yCursor = 80;
-  const nodes = parsed.map(n => {
+  const nodes = canonical.map(n => {
     const position = { x: 80 + n.depth * 280, y: yCursor };
     yCursor += 120;
     return { id: n.id, type: 'powerNode', position, data: buildNodeData(n, batteryMap, effMap, profileMap) };
   });
 
-  const projectName = (strOf(ws.getCell(1, 1).value as CellVal).replace(/ —.*$/, '').trim()) || 'Imported project';
+  // Reconstruct power states from each per-state sheet (or one state if single).
+  const powerStates = sourceSheets.map((s, si) => {
+    const cols = colsFor(s.ws, s.hr);
+    const rows = parseSheetNodes(s.ws, s.hr, cols);
+    const subtitle = strOf(s.ws.getCell(2, 1).value as CellVal);
+    const dutyM = subtitle.match(/\(([\d.]+)%\s*duty\)/);
+    const frac = dutyM ? parseFloat(dutyM[1]) / 100 : (1 / sourceSheets.length);
+    const stateName = stateSheets.length > 0 ? s.ws.name : (strOf(s.ws.getCell(2, 1).value as CellVal).match(/"([^"]+)"/)?.[1] || 'Operating');
+
+    const loadSnapshots: Record<string, unknown> = {};
+    const enabledOverrides: Record<string, boolean> = {};
+    canonical.forEach((cn, i) => {
+      const rv = rows[i] ?? cn; // aligned by identical layout
+      if (cn.nodeType === 'load') {
+        const baseData = nodes[i].data as Record<string, unknown>;
+        loadSnapshots[cn.id] = {
+          ...baseData,
+          voltage: rv.vout || (baseData.voltage as number) || 0,
+          fixedCurrent: rv.iout || 0,
+          enabled: !rv.disabled,
+        };
+      }
+      if (cn.nodeType === 'converter' || cn.nodeType === 'series' || cn.nodeType === 'load') {
+        enabledOverrides[cn.id] = !rv.disabled;
+      }
+    });
+
+    return {
+      id: stateSheets.length > 0 ? (s.ws.name || `state_${si}`) : 'operating',
+      name: stateName,
+      fractionOfTime: frac,
+      loadSnapshots,
+      enabledOverrides,
+    };
+  });
+
+  const projectName = (strOf(base.ws.getCell(1, 1).value as CellVal).replace(/ —.*$/, '').trim()) || 'Imported project';
 
   const project = {
     version: 4,
@@ -268,7 +319,7 @@ export async function importProjectFromExcel(file: File): Promise<string> {
     notes: [],
     theme: 'light',
     activeScenario: 'nom',
-    powerStates: [{ id: 'imported', name: 'Imported', fractionOfTime: 1, loadSnapshots: {} }],
+    powerStates,
     nodes,
     edges,
   };
