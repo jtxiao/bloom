@@ -947,7 +947,7 @@ const TIME_UNITS: [string, number][] = [
 const UNIT_LIST = TIME_UNITS.map(u => u[0]).join(',');
 
 interface FeatureTabOpts {
-  states: { name: string; sheet: string }[]; // feature = power state, with its budget sheet
+  states: { name: string; sheet: string; frac: number }[]; // feature = power state + its budget sheet + duty fraction
   pinCol: string;       // column letter of Pin on the budget sheets
   batteryRow: number;   // row of the battery source on the budget sheets
   energyRef: string;    // cell ref to usable energy (Wh) on the Battery Life tab
@@ -1004,13 +1004,16 @@ function buildFeatureImpactTab(workbook: ExcelJS.Workbook, opts: FeatureTabOpts)
   });
 
   const first = hr + 1;
+  const idleIdx = states.length - 1; // default idle = last state
   states.forEach((st, i) => {
     const rn = first + i;
     ws.getCell(rn, 1).value = st.name;
-    // Every row gets real default inputs (no blanks). The state chosen as idle
-    // ignores these and takes the remaining time share instead.
-    ws.getCell(rn, 2).value = 0;     // active duration
-    ws.getCell(rn, 3).value = 's';
+    // Seed each feature from the project's duty split: fraction of a 1-day
+    // period (e.g. 50% -> "12 hr every 1 day"). The idle state ignores these
+    // and takes the remaining time share.
+    const activeHrs = Math.round(Math.max(0, Math.min(1, st.frac)) * 24 * 1000) / 1000;
+    ws.getCell(rn, 2).value = i === idleIdx ? 0 : activeHrs;
+    ws.getCell(rn, 3).value = i === idleIdx ? 's' : 'hr';
     ws.getCell(rn, 4).value = 1;     // period
     ws.getCell(rn, 5).value = 'day';
     // unit dropdowns
@@ -1143,7 +1146,7 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
         ctx,
       );
     }
-    featureStates = stateSheets.map(s => ({ name: s.st.name || s.st.id, sheet: s.sheet }));
+    featureStates = stateSheets.map(s => ({ name: s.st.name || s.st.id, sheet: s.sheet, frac: s.frac }));
   } else {
     layout = buildSheet(
       workbook,
@@ -1153,7 +1156,7 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
       r => getWeightedMetrics(r, activeScenario),
       ctx,
     );
-    featureStates = [{ name: states[0]?.name || 'Operating', sheet: 'Summary' }];
+    featureStates = [{ name: states[0]?.name || 'Operating', sheet: 'Summary', frac: 1 }];
   }
 
   // Battery life tab (after the budget sheets, before the reference tabs).

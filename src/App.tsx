@@ -51,6 +51,7 @@ import {
 import type { AnalysisWorkerResponse } from './workers/analysisWorker.types';
 import { computeUpstreamAncestorOffMap, hasUpstreamAncestorOff } from './utils/upstreamEnabled';
 import { exportPowerBudgetExcel } from './utils/exportExcel';
+import { importProjectFromExcel } from './utils/importExcel';
 
 const nodeTypes = { powerNode: PowerNode, groupNode: GroupNode, textNode: TextNode };
 const edgeTypes = { smart: SmartBezierEdge };
@@ -1963,6 +1964,46 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
     }
   }, [nodes.length, doLoadProject]);
 
+  const doImportExcel = useCallback(async () => {
+    const handleFile = async (file: File) => {
+      try {
+        const json = await importProjectFromExcel(file);
+        fileHandleRef.current = null; // imported project is not tied to a .json file
+        loadProjectFromJson(json);
+      } catch (err) {
+        showLoadError(err instanceof Error ? `Could not import spreadsheet: ${err.message}` : 'Could not import spreadsheet.');
+      }
+    };
+    if ('showOpenFilePicker' in window) {
+      try {
+        const [handle] = await (window as unknown as { showOpenFilePicker: (opts: unknown) => Promise<FileSystemFileHandle[]> }).showOpenFilePicker({
+          types: [{ description: 'Excel', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }],
+          multiple: false,
+        });
+        await handleFile(await handle.getFile());
+      } catch (e) {
+        const name = e && typeof e === 'object' && 'name' in e ? String((e as { name: string }).name) : '';
+        if (name === 'AbortError') return;
+        showLoadError('Could not read the selected file.');
+      }
+    } else {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.xlsx';
+      input.onchange = () => { const f = input.files?.[0]; if (f) handleFile(f); };
+      input.click();
+    }
+  }, [loadProjectFromJson, showLoadError]);
+
+  const importExcel = useCallback(() => {
+    if (nodes.length > 0) {
+      pendingLoadRef.current = doImportExcel;
+      setShowSaveConfirm('load');
+    } else {
+      doImportExcel();
+    }
+  }, [nodes.length, doImportExcel]);
+
   const [showStateManager, setShowStateManager] = useState(false);
   const [stateManagerDraft, setStateManagerDraft] = useState<PowerState[]>([]);
   const [newStateName, setNewStateName] = useState('');
@@ -2115,6 +2156,13 @@ function FlowCanvas({ theme, onSetTheme, heatmap, projectNotes, onSetProjectNote
                     onClick={() => { setFileMenuOpen(false); exportExcel(); }}
                   >
                     Export to Excel…
+                  </button>
+                  <button
+                    className="file-menu-item"
+                    role="menuitem"
+                    onClick={() => { setFileMenuOpen(false); importExcel(); }}
+                  >
+                    Import from Excel…
                   </button>
                 </div>
               )}
