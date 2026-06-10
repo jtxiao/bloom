@@ -140,9 +140,12 @@ type ProfileRef = { avg: string };
 const EFF_SHEET = 'Efficiency Curves';
 const PROFILE_SHEET = 'Load Profiles';
 
-function getStateMetrics(r: AnalysisResult, stateId: string, scenario: VoltageScenario): NodeMetrics {
+function getStateMetrics(r: AnalysisResult, stateId: string, scenario: VoltageScenario, state?: PowerState): NodeMetrics {
   const sr: StateResult | undefined =
     r.scenarioStateResults?.[scenario]?.[stateId] ?? r.stateResults?.[stateId];
+  // Off in THIS state via the state's enable toggles (not just globally off).
+  const offInState = state?.enabledOverrides?.[r.nodeId] === false
+    || (r.type === 'load' && state?.loadSnapshots?.[r.nodeId]?.enabled === false);
   if (!sr) {
     return { vout: 0, ioutAvg: 0, ioutPeak: 0, efficiency: 0, pin: 0, pout: 0, loss: 0, aux: 0, disabled: true };
   }
@@ -155,7 +158,7 @@ function getStateMetrics(r: AnalysisResult, stateId: string, scenario: VoltageSc
     pout: sr.outputPower,
     loss: sr.powerLoss,
     aux: sr.auxPower ?? 0,
-    disabled: r.disabled,
+    disabled: r.disabled || offInState,
   };
 }
 
@@ -1142,7 +1145,7 @@ export async function buildPowerBudgetWorkbook(args: ExportExcelArgs): Promise<E
         sheet,
         `Power state "${st.name}" (${pct}% duty) — ${scenarioLabel}`,
         args,
-        r => getStateMetrics(r, st.id, activeScenario),
+        r => getStateMetrics(r, st.id, activeScenario, st),
         ctx,
       );
     }
