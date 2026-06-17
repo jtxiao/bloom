@@ -7,15 +7,15 @@
   --border: #2A2E38;
   --text: #D8DAE0;
   --text-dim: #8B8F9A;
-  --accent: #C4A8B8;
-  --accent-hover: #B397A7;
+  --accent: #7C5CD6;
+  --accent-hover: #6A47C7;
   --source-color: #C9504A;
   --converter-color: #3578A0;
   --series-color: #4AA876;
   --load-color: #D4A24E;
-  --danger: #C9504A;
-  --shadow-node: rgba(0, 0, 0, 0.6);
-  --shadow-node-hover: rgba(0, 0, 0, 0.8);
+  --danger: #E0484F;
+  --shadow-node: rgba(0, 0, 0, 0.35);
+  --shadow-node-hover: rgba(0, 0, 0, 0.5);
   --overlay-bg: rgba(0, 0, 0, 0.5);
   --digitizer-overlay: rgba(0, 0, 0, 0.8);
   --analysis-bg: rgba(0, 0, 0, 0.25);
@@ -33,13 +33,13 @@
   --border: #D5CEBC;
   --text: #2C2A26;
   --text-dim: #7A7568;
-  --accent: #C4A8B8;
-  --accent-hover: #B397A7;
+  --accent: #6A47C7;
+  --accent-hover: #5A38B0;
   --source-color: #C9504A;
-  --converter-color: #3578A0;
-  --series-color: #4AA876;
-  --load-color: #D4A24E;
-  --danger: #C9504A;
+  --converter-color: #2F6E96;
+  --series-color: #3E9468;
+  --load-color: #C28F38;
+  --danger: #CE3A41;
   --shadow-node: rgba(0, 0, 0, 0.08);
   --shadow-node-hover: rgba(0, 0, 0, 0.14);
   --overlay-bg: rgba(0, 0, 0, 0.3);
@@ -721,7 +721,7 @@ body {
   min-width: 150px;
   border-radius: 6px;
   overflow: hidden;
-  border: none;
+  border: 1px solid var(--border);
   background: var(--node-bg);
   box-shadow: 0 2px 10px var(--shadow-node);
 }
@@ -933,6 +933,26 @@ body {
 .config-fields input:focus,
 .config-fields select:focus {
   border-color: var(--accent);
+}
+
+/* Visible keyboard focus rings (a11y) — only for keyboard navigation, not mouse clicks */
+.config-fields input:focus-visible,
+.config-fields select:focus-visible,
+.config-fields textarea:focus-visible,
+.notes-textarea:focus-visible,
+.project-name-input:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+button:focus-visible,
+.toolbar-btn:focus-visible,
+.analyze-btn:focus-visible,
+.toggle-btn:focus-visible,
+.delete-btn:focus-visible,
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .toggle-label {
