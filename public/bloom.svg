@@ -1,0 +1,21 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bloom logo">
+  <defs>
+    <filter id="riso" x="-30%" y="-30%" width="160%" height="160%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.026" numOctaves="2" seed="9" result="warp"/>
+      <feDisplacementMap in="SourceGraphic" in2="warp" scale="3.4" result="disp"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" seed="4" result="speck"/>
+      <feColorMatrix in="speck" type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.3 0" result="light"/>
+      <feComposite in="light" in2="disp" operator="in" result="grain"/>
+      <feMerge><feMergeNode in="disp"/><feMergeNode in="grain"/></feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#riso)">
+    <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#E36A5E" transform="translate(50 53) rotate(0) scale(1)"/>
+    <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#5AA6D4" transform="translate(50 53) rotate(72) scale(1)"/>
+    <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#5FC08D" transform="translate(50 53) rotate(144) scale(1)"/>
+    <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#EEBB5C" transform="translate(50 53) rotate(216) scale(1)"/>
+    <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#B17F98" transform="translate(50 53) rotate(288) scale(1)"/>
+  </g>
+  <circle cx="50" cy="53" r="6" fill="#FBF6EE"/>
+  <circle cx="50" cy="53" r="2.6" fill="#6B445A"/>
+</svg>

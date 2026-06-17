@@ -1,6 +1,6 @@
 import { DragEvent, useState } from 'react';
 import Tooltip from './Tooltip';
-import bloomLogo from '/bloom-logo.png?url';
+import bloomLogo from '/bloom.svg?url';
 
 const componentTypes = [
   { type: 'source', label: 'Power Source', desc: 'Battery, USB, Wall adapter' },
