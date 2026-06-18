@@ -6,6 +6,6 @@
     <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#EEBB5C" transform="translate(50 53) rotate(216) scale(1)"/>
     <path d="M0 0 C-18 -12.5 -16.6 -31.2 0 -39 C16.6 -31.2 18 -12.5 0 0 Z" fill="#B17F98" transform="translate(50 53) rotate(288) scale(1)"/>
   </g>
-  <circle cx="50" cy="53" r="6" fill="#FBF6EE"/>
-  <circle cx="50" cy="53" r="2.6" fill="#6B445A"/>
+  <circle cx="50" cy="53" r="4.6" fill="#FBF6EE"/>
+  <circle cx="50" cy="53" r="2" fill="#6B445A"/>
 </svg>
